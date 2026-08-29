@@ -5,6 +5,7 @@ It starts from a neutral directory and refers to the snapshot by absolute path.
 The verifier reports `CONFIRMED`, `REFUTED`, or `BLOCKED` and never repairs the candidate.
 
 Strict verification stays unavailable until every isolation and non-mutation canary passes.
+The internal gate tool accepts evidence only when all 15 raw artifacts match the frozen candidate and client binaries.
 Failure to establish the required sandbox returns `BLOCKED`.
 Advisory review cannot satisfy a high-risk or release gate.
 Verifier commands receive a fixed environment, read-only snapshot, no command network, and no nested agents.

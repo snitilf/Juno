@@ -1929,7 +1929,7 @@ fn read_shared_utf8(
         .map_err(|_| CommandError::Blocked(format!("{label} is not UTF-8")))
 }
 
-fn release_bundle_sha256() -> String {
+pub(crate) fn release_bundle_sha256() -> String {
     let parts = [
         crate::VERSION.as_bytes(),
         CATALOG_SOURCE.as_bytes(),

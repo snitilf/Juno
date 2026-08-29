@@ -2,6 +2,7 @@ mod assets;
 mod catalog;
 mod compatibility;
 mod eval;
+pub mod gates;
 mod lifecycle;
 mod secure_fs;
 mod snapshot;

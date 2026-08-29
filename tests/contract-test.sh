@@ -106,6 +106,12 @@ assert certification["gates"]["seeded_defects_detected"] == 120
 assert certification["gates"]["routing_correct_min"] == 119
 assert certification["gates"]["clean_false_positives_max"] == 1
 
+with (root / "evals/development-cases.toml").open("rb") as handle:
+    development = tomllib.load(handle)
+assert development["status"] == "open"
+assert len(development["cases"]) == 24
+assert len({case["id"] for case in development["cases"]}) == 24
+
 ledger = (root / "docs/REVALIDATION.md").read_text()
 rows = [line for line in ledger.splitlines() if line.startswith("| C-")]
 assert rows
@@ -177,6 +183,9 @@ required_files = (
     "docs/verification.md",
     "config/compatibility.toml",
     "scripts/build-bundle.sh",
+    "scripts/release-gates.sh",
+    "examples/release-gates.rs",
+    "evals/development-cases.toml",
 )
 for name in required_files:
     assert (root / name).is_file(), f"missing required file: {name}"

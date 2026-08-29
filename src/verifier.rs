@@ -1,3 +1,4 @@
+use crate::gates::{CanaryRecord, CandidateRecord};
 use crate::secure_fs::{SecureRoot, hex_sha256};
 use crate::{Catalog, Roots, Snapshot, create_snapshot};
 use serde::{Deserialize, Serialize};
@@ -68,16 +69,6 @@ enum Severity {
     High,
     Medium,
     Low,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct CanaryRecord {
-    schema_version: u32,
-    verified_on: String,
-    juno_sha256: String,
-    codex_sha256: String,
-    passed: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -162,17 +153,13 @@ pub fn verify(request: &VerifyRequest, roots: &Roots) -> Result<String, String> 
     );
     let verifier_root = roots.state_home.join("verifier");
     let state = SecureRoot::create(&roots.state_home).map_err(|error| error.to_string())?;
-    let canary_content = state
-        .read_bounded(Path::new("verifier/canaries.json"), 1024 * 1024)
-        .map_err(|_| "BLOCKED: strict canary record is unreadable".to_string())?
-        .ok_or_else(|| "BLOCKED: strict canary record is missing".to_string())?;
-    let canaries = read_canaries(&canary_content)?;
+    let (candidate, canaries) = read_gate_records(&state)?;
     let required_canaries = required_canaries()?;
-    if canaries.schema_version != 1
-        || canaries.verified_on.is_empty()
+    if candidate.binary_sha256 != juno_hash
         || canaries.juno_sha256 != juno_hash
         || canaries.codex_sha256 != codex_hash
-        || canaries.passed != required_canaries.iter().cloned().collect::<BTreeSet<_>>()
+        || canaries.passed_names() != required_canaries.iter().cloned().collect::<BTreeSet<_>>()
+        || canaries.validate(&candidate).is_err()
     {
         return Err("BLOCKED: strict canaries have not passed for this Codex binary".into());
     }
@@ -277,22 +264,17 @@ pub(crate) fn strict_status(roots: &Roots) -> String {
     let Ok(state) = SecureRoot::create(&roots.state_home) else {
         return "unavailable: unsafe verifier state".into();
     };
-    let Ok(Some(canary_content)) =
-        state.read_bounded(Path::new("verifier/canaries.json"), 1024 * 1024)
-    else {
+    let Ok((candidate, canaries)) = read_gate_records(&state) else {
         return "unavailable: canaries not passed".into();
-    };
-    let Ok(canaries) = read_canaries(&canary_content) else {
-        return "unavailable: invalid canary record".into();
     };
     let Ok(required_canaries) = required_canaries() else {
         return "unavailable: invalid canary contract".into();
     };
-    if canaries.schema_version == 1
-        && !canaries.verified_on.is_empty()
+    if candidate.binary_sha256 == hex_sha256(&juno_content)
         && canaries.juno_sha256 == hex_sha256(&juno_content)
         && canaries.codex_sha256 == hex_sha256(&content)
-        && canaries.passed == required_canaries.into_iter().collect::<BTreeSet<_>>()
+        && canaries.passed_names() == required_canaries.into_iter().collect::<BTreeSet<_>>()
+        && canaries.validate(&candidate).is_ok()
     {
         "available".into()
     } else {
@@ -459,9 +441,26 @@ fn nested_sandbox_probe() -> Result<(), String> {
     Ok(())
 }
 
-fn read_canaries(content: &[u8]) -> Result<CanaryRecord, String> {
-    serde_json::from_slice(content)
-        .map_err(|error| format!("BLOCKED: strict canary record is invalid: {error}"))
+fn read_gate_records(state: &SecureRoot) -> Result<(CandidateRecord, CanaryRecord), String> {
+    let candidate_content = state
+        .read_bounded(Path::new("release/candidate.json"), 1024 * 1024)
+        .map_err(|_| "BLOCKED: candidate record is unreadable".to_string())?
+        .ok_or_else(|| "BLOCKED: candidate record is missing".to_string())?;
+    let canary_content = state
+        .read_bounded(Path::new("verifier/canaries.json"), 1024 * 1024)
+        .map_err(|_| "BLOCKED: strict canary record is unreadable".to_string())?
+        .ok_or_else(|| "BLOCKED: strict canary record is missing".to_string())?;
+    let candidate: CandidateRecord = serde_json::from_slice(&candidate_content)
+        .map_err(|error| format!("BLOCKED: candidate record is invalid: {error}"))?;
+    let canaries: CanaryRecord = serde_json::from_slice(&canary_content)
+        .map_err(|error| format!("BLOCKED: strict canary record is invalid: {error}"))?;
+    candidate
+        .validate()
+        .map_err(|error| format!("BLOCKED: candidate record is invalid: {error}"))?;
+    canaries
+        .validate(&candidate)
+        .map_err(|error| format!("BLOCKED: strict canary record is invalid: {error}"))?;
+    Ok((candidate, canaries))
 }
 
 fn required_canaries() -> Result<Vec<String>, String> {

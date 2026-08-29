@@ -1,0 +1,146 @@
+schema_version = 1
+status = "open"
+
+[[cases]]
+id = "lookup-single-symbol"
+task = "Find the definition and callers of one named symbol without editing files."
+expected_owner = "scout"
+expected_verifier = "light_verifier"
+
+[[cases]]
+id = "lookup-config-key"
+task = "Find where one configuration key is read and report its default."
+expected_owner = "scout"
+expected_verifier = "light_verifier"
+
+[[cases]]
+id = "scan-feature-flow"
+task = "Map a feature across configuration, runtime code, tests, and documentation."
+expected_owner = "surveyor"
+expected_verifier = "verifier"
+
+[[cases]]
+id = "scan-unknown-regression"
+task = "Inspect an unfamiliar regression and identify the smallest likely fault area."
+expected_owner = "surveyor"
+expected_verifier = "verifier"
+
+[[cases]]
+id = "rename-local-field"
+task = "Rename one private field and update its direct tests."
+expected_owner = "mech_executor"
+expected_verifier = "light_verifier"
+
+[[cases]]
+id = "format-static-fixture"
+task = "Apply a fixed formatting change to one test fixture."
+expected_owner = "mech_executor"
+expected_verifier = "light_verifier"
+
+[[cases]]
+id = "fix-bounded-parser"
+task = "Fix a parser bug with clear reproduction steps and bounded file scope."
+expected_owner = "executor"
+expected_verifier = "verifier"
+
+[[cases]]
+id = "refactor-state-machine"
+task = "Refactor a state machine while preserving all public behavior."
+expected_owner = "executor"
+expected_verifier = "verifier"
+
+[[cases]]
+id = "review-small-patch"
+task = "Review a small low-risk patch for its stated acceptance criteria."
+expected_owner = "main"
+expected_verifier = "light_verifier"
+
+[[cases]]
+id = "review-semantic-patch"
+task = "Review a semantic code change that crosses several modules."
+expected_owner = "main"
+expected_verifier = "verifier"
+
+[[cases]]
+id = "review-release-candidate"
+task = "Review a frozen release candidate against its full contract."
+expected_owner = "main"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "change-auth-boundary"
+task = "Change authentication handling where leaked credentials would be severe."
+expected_owner = "security_executor"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "change-permission-policy"
+task = "Change filesystem permission enforcement for untrusted commands."
+expected_owner = "security_executor"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "change-secret-filter"
+task = "Change environment filtering that protects inherited secrets."
+expected_owner = "security_executor"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "unclear-destructive-migration"
+task = "Migrate user state with unclear rollback rules and possible data loss."
+expected_owner = "main"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "unclear-shared-config"
+task = "Edit a shared configuration file when the required product choice is missing."
+expected_owner = "main"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "high-impact-dependency"
+task = "Replace a core dependency without a proven compatibility boundary."
+expected_owner = "main"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "high-impact-data-format"
+task = "Change a persisted data format used by existing installations."
+expected_owner = "main"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "repair-after-refuted"
+task = "Repair every material finding from a refuted independent review."
+expected_owner = "executor"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "verify-after-repair"
+task = "Verify a repaired candidate in a fresh process without editing it."
+expected_owner = "main"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "docs-only-clarity"
+task = "Clarify one short document without changing product behavior."
+expected_owner = "mech_executor"
+expected_verifier = "light_verifier"
+
+[[cases]]
+id = "diagnose-test-flake"
+task = "Diagnose a test failure whose cause is not yet known."
+expected_owner = "surveyor"
+expected_verifier = "verifier"
+
+[[cases]]
+id = "fix-concurrency-race"
+task = "Fix a reproduced race that can corrupt transaction state."
+expected_owner = "security_executor"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "read-only-repo-summary"
+task = "Summarize the layout and current test commands of a small repository."
+expected_owner = "scout"
+expected_verifier = "light_verifier"
