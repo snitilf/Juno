@@ -1,0 +1,14 @@
+notes/
+.DS_Store
+.tmp/
+tmp/
+*.tmp
+*.log
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage/
+build/
+dist/

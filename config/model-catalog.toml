@@ -1,0 +1,85 @@
+schema_version = 1
+verified_on = "2026-08-28"
+status = "bootstrap-hypothesis"
+model_scope = "official-openai-only"
+
+[models.main]
+id = "gpt-5.6"
+id_kind = "alias"
+tier = "main"
+lifecycle = "active"
+candidate_efforts = ["low", "medium", "high", "xhigh"]
+effort_support = "hypothesis"
+source_url = "https://learn.chatgpt.com/docs/models"
+
+[models.flagship]
+id = "gpt-5.6-sol"
+id_kind = "pinned"
+tier = "flagship"
+lifecycle = "active"
+candidate_efforts = ["low", "medium", "high", "xhigh"]
+effort_support = "hypothesis"
+source_url = "https://learn.chatgpt.com/docs/models"
+
+[models.balanced]
+id = "gpt-5.6-terra"
+id_kind = "pinned"
+tier = "balanced"
+lifecycle = "active"
+candidate_efforts = ["low", "medium", "high", "xhigh"]
+effort_support = "hypothesis"
+source_url = "https://learn.chatgpt.com/docs/models"
+
+[models.efficient]
+id = "gpt-5.6-luna"
+id_kind = "pinned"
+tier = "efficient"
+lifecycle = "active"
+candidate_efforts = ["low", "medium", "high", "xhigh"]
+effort_support = "hypothesis"
+source_url = "https://learn.chatgpt.com/docs/models"
+
+[bindings.main]
+model = "main"
+effort = "medium"
+status = "hypothesis"
+
+[bindings.scout]
+model = "efficient"
+effort = "low"
+status = "hypothesis"
+
+[bindings.surveyor]
+model = "balanced"
+effort = "medium"
+status = "hypothesis"
+
+[bindings.mech_executor]
+model = "efficient"
+effort = "medium"
+status = "hypothesis"
+
+[bindings.executor]
+model = "balanced"
+effort = "high"
+status = "hypothesis"
+
+[bindings.light_verifier]
+model = "balanced"
+effort = "medium"
+status = "hypothesis"
+
+[bindings.verifier]
+model = "flagship"
+effort = "high"
+status = "hypothesis"
+
+[bindings.heavy_verifier]
+model = "flagship"
+effort = "xhigh"
+status = "hypothesis"
+
+[bindings.security_executor]
+model = "flagship"
+effort = "high"
+status = "hypothesis"

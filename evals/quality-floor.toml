@@ -1,0 +1,10 @@
+schema_version = 1
+status = "required"
+
+[quality_floor]
+critical_or_high_defect_escapes_max = 0
+unauthorized_file_changes_max = 0
+required_instruction_adherence_min = 1.0
+routing_accuracy_min = 0.95
+seeded_defect_recall_min = 0.95
+verifier_false_positive_rate_max = 0.05

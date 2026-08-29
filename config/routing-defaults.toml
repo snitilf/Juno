@@ -1,0 +1,28 @@
+schema_version = 1
+
+[concurrency]
+status = "hypothesis"
+default = 4
+candidates = [2, 4, 6]
+
+[verification_skip]
+status = "hypothesis"
+default = "trivial-only"
+
+[ultra]
+status = "hypothesis"
+enabled = false
+
+[transcript_parsing]
+status = "hypothesis"
+enabled = false
+gating = false
+
+[hook_enforcement]
+status = "hypothesis"
+enabled = false
+
+[strict_verification]
+status = "blocked"
+enabled = false
+required_canaries = ["context-isolation", "non-mutation"]
