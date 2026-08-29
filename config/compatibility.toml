@@ -1,0 +1,28 @@
+schema_version = 1
+verified_on = "2026-08-29"
+status = "test-target"
+
+[platform]
+os = "macOS"
+version = "26.5.1"
+build = "25F80"
+architecture = "arm64"
+
+[standalone_cli]
+path = "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js"
+payload_path = "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+version = "0.147.0"
+launcher_sha256 = "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477"
+payload_sha256 = "19c4f144c5226a9f17c58e6f0fa854843b0f77a6eb420f40e2745a12f10f5d37"
+certification = "not-run"
+
+[desktop]
+path = "/Applications/ChatGPT.app"
+executable_path = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+embedded_cli_path = "/Applications/ChatGPT.app/Contents/Resources/codex"
+version = "26.818.41509"
+build = "6962"
+executable_sha256 = "3b9de9f193f5cf263ea001f390fbc6a86e56bd6ca1e2c554b264d17be6fc8989"
+embedded_cli_version = "0.149.0-alpha.4.1"
+embedded_cli_sha256 = "09db9560f6f9dec139d3324254fb3c8fdbad5ecce1d8c794113dc15294f6aefd"
+certification = "not-run"

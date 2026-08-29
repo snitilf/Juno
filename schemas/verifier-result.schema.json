@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["verdict", "material_findings", "unverified_assumptions"],
+  "properties": {
+    "verdict": { "enum": ["CONFIRMED", "REFUTED", "BLOCKED"] },
+    "material_findings": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "required": ["severity", "claim", "evidence", "consequence", "required_correction"],
+        "properties": {
+          "severity": { "enum": ["critical", "high", "medium", "low"] },
+          "claim": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "evidence": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "consequence": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "required_correction": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "unverified_assumptions": {
+      "type": "array",
+      "maxItems": 200,
+      "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+    }
+  },
+  "additionalProperties": false
+}

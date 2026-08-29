@@ -25,4 +25,20 @@ enabled = false
 [strict_verification]
 status = "blocked"
 enabled = false
-required_canaries = ["context-isolation", "non-mutation"]
+required_canaries = [
+  "dedicated-authentication",
+  "secret-isolation",
+  "fresh-context",
+  "candidate-nonmutation",
+  "permission-enforcement",
+  "environment-filtering",
+  "command-network-blocking",
+  "hosted-capability-removal",
+  "nested-sandbox",
+  "recursion-blocking",
+  "filesystem-escape",
+  "network-escape",
+  "snapshot-instruction-isolation",
+  "snapshot-override-isolation",
+  "snapshot-project-config-isolation",
+]

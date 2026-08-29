@@ -11,4 +11,4 @@ In-process review is advisory only.
 
 ## Result
 
-Strict verification stays disabled until context-isolation and non-mutation canaries pass.
+Strict verification stays disabled until every required canary passes.

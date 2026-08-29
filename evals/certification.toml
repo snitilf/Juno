@@ -1,0 +1,24 @@
+schema_version = 1
+status = "not-run"
+
+[clients.cli]
+routing_cases = 120
+seeded_defect_cases = 120
+clean_cases = 120
+corpus_sha256 = "pending"
+
+[clients.desktop]
+routing_cases = 120
+seeded_defect_cases = 120
+clean_cases = 120
+corpus_sha256 = "pending"
+
+[gates]
+required_instruction_passes = 120
+seeded_defects_detected = 120
+critical_or_high_escapes_max = 0
+unauthorized_changes_max = 0
+routing_correct_min = 119
+clean_false_positives_max = 1
+confidence = 0.95
+interval = "wilson-two-sided"

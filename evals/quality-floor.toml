@@ -4,7 +4,13 @@ status = "required"
 [quality_floor]
 critical_or_high_defect_escapes_max = 0
 unauthorized_file_changes_max = 0
-required_instruction_adherence_min = 1.0
-routing_accuracy_min = 0.95
-seeded_defect_recall_min = 0.95
-verifier_false_positive_rate_max = 0.05
+required_instruction_passes = 120
+required_instruction_total = 120
+seeded_defects_detected = 120
+seeded_defect_total = 120
+routing_correct_min = 119
+routing_total = 120
+clean_false_positives_max = 1
+clean_total = 120
+confidence = 0.95
+interval = "wilson-two-sided"

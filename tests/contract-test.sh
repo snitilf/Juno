@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import json
 import subprocess
 import tomllib
 import urllib.parse
@@ -26,6 +27,9 @@ for path in files:
     if path.suffix == ".toml":
         with path.open("rb") as handle:
             tomllib.load(handle)
+    if path.suffix == ".json":
+        with path.open() as handle:
+            json.load(handle)
 
 catalog_path = root / "config/model-catalog.toml"
 with catalog_path.open("rb") as handle:
@@ -34,6 +38,7 @@ with catalog_path.open("rb") as handle:
 models = catalog["models"]
 bindings = catalog["bindings"]
 assert catalog["model_scope"] == "official-openai-only"
+assert catalog["model_family"].startswith("gpt-")
 expected_bindings = {
     "main",
     "scout",
@@ -53,7 +58,7 @@ official_hosts = {
     "learn.chatgpt.com",
 }
 for model in models.values():
-    assert model["id"].startswith("gpt-")
+    assert model["id"] == catalog["model_family"] or model["id"].startswith(catalog["model_family"] + "-")
     assert urllib.parse.urlparse(model["source_url"]).hostname in official_hosts
     assert model["effort_support"] == "hypothesis"
 
@@ -74,6 +79,32 @@ for name in (
     assert routing[name]["status"] == "hypothesis"
 assert routing["strict_verification"]["status"] == "blocked"
 assert routing["strict_verification"]["enabled"] is False
+assert len(routing["strict_verification"]["required_canaries"]) == 15
+
+with (root / "config/compatibility.toml").open("rb") as handle:
+    compatibility = tomllib.load(handle)
+assert compatibility["status"] == "test-target"
+assert compatibility["platform"]["architecture"] == "arm64"
+assert compatibility["standalone_cli"]["certification"] == "not-run"
+assert compatibility["desktop"]["certification"] == "not-run"
+for section, keys in (
+    ("standalone_cli", ("launcher_sha256", "payload_sha256")),
+    ("desktop", ("executable_sha256", "embedded_cli_sha256")),
+):
+    for key in keys:
+        assert re.fullmatch(r"[0-9a-f]{64}", compatibility[section][key])
+
+with (root / "evals/certification.toml").open("rb") as handle:
+    certification = tomllib.load(handle)
+assert certification["status"] == "not-run"
+for client in certification["clients"].values():
+    assert client["routing_cases"] == 120
+    assert client["seeded_defect_cases"] == 120
+    assert client["clean_cases"] == 120
+assert certification["gates"]["required_instruction_passes"] == 120
+assert certification["gates"]["seeded_defects_detected"] == 120
+assert certification["gates"]["routing_correct_min"] == 119
+assert certification["gates"]["clean_false_positives_max"] == 1
 
 ledger = (root / "docs/REVALIDATION.md").read_text()
 rows = [line for line in ledger.splitlines() if line.startswith("| C-")]
@@ -126,5 +157,28 @@ for path in ignored_paths:
     subprocess.run(["git", "check-ignore", "-q", path], check=True)
 
 assert all(not name.startswith("notes/") for name in listed)
+
+readme = (root / "README.md").read_text()
+design = (root / "docs/design.md").read_text()
+native_adr = (root / "docs/adr/0005-native-codex-loading.md").read_text()
+assert "normal Codex CLI and desktop sessions load Juno" in readme
+assert "does not require a wrapper command for daily use" in readme
+assert "Juno does not change Pi" in readme
+assert "only when Pi launches the real `codex` executable" in readme
+assert "Loaded project instructions remain closer in scope" in design
+assert "Juno does not change Pi or make model selection inside Pi" in design
+assert "Lifecycle tools may install, update, check, or remove Juno" in design
+assert "Do not change Pi" in native_adr
+assert "project_doc_max_bytes" in design
+
+required_files = (
+    "LICENSE",
+    "docs/lifecycle.md",
+    "docs/verification.md",
+    "config/compatibility.toml",
+    "scripts/build-bundle.sh",
+)
+for name in required_files:
+    assert (root / name).is_file(), f"missing required file: {name}"
 print("contract tests passed")
 PY
