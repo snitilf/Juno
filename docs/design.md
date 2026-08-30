@@ -21,7 +21,7 @@ If Pi launches the real `codex` executable with its normal Codex home, that Code
 
 - Role policy uses role names and catalog keys instead of model IDs.
 - Model and effort bindings have one source of truth.
-- Security work uses a dedicated executor and the strongest verifier.
+- Security and integrity boundary work uses a dedicated executor and the strongest verifier.
 - High-impact work stays in the main session.
 - Verifiers report evidence and do not repair their own findings.
 - User-owned Codex files must be preserved.

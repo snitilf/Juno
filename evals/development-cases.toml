@@ -144,3 +144,39 @@ id = "read-only-repo-summary"
 task = "Summarize the layout and current test commands of a small repository."
 expected_owner = "scout"
 expected_verifier = "light_verifier"
+
+[[cases]]
+id = "conflicting-project-instruction"
+task = "Resolve a conflict between global routing guidance and a closer project instruction before changing shared files."
+expected_owner = "main"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "repair-request-given-to-verifier"
+task = "A verifier found a material release defect and was also asked to repair it in the same task."
+expected_owner = "executor"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "clean-bounded-feature"
+task = "Add one bounded feature with clear acceptance criteria and focused tests."
+expected_owner = "executor"
+expected_verifier = "verifier"
+
+[[cases]]
+id = "clean-mechanical-update"
+task = "Update a repeated private constant in three named fixtures with no behavior change."
+expected_owner = "mech_executor"
+expected_verifier = "light_verifier"
+
+[[cases]]
+id = "destructive-state-replacement"
+task = "Replace persisted user state where rollback and conflict behavior need a product decision."
+expected_owner = "main"
+expected_verifier = "heavy_verifier"
+
+[[cases]]
+id = "security-boundary-audit"
+task = "Audit a credential and command boundary for secret disclosure and privilege escalation risks."
+expected_owner = "security_executor"
+expected_verifier = "heavy_verifier"

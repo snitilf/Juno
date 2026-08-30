@@ -1,3 +1,6 @@
+mod common;
+
+use common::{replace_source, write_release_evidence};
 use juno::{LifecycleCommand, LifecycleOptions, RecoveryStrategy, Roots, execute_lifecycle};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -15,15 +18,15 @@ fn fixture() -> (tempfile::TempDir, Roots) {
     fs::write(&source_bin, b"fake juno binary").unwrap();
     fs::set_permissions(&source_bin, fs::Permissions::from_mode(0o755)).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
-    (
-        temp,
-        Roots {
-            codex_home,
-            state_home,
-            install_bin,
-            source_bin,
-        },
-    )
+    fs::create_dir_all(install_bin.parent().unwrap()).unwrap();
+    let roots = Roots {
+        codex_home,
+        state_home,
+        install_bin,
+        source_bin,
+    };
+    write_release_evidence(&roots);
+    (temp, roots)
 }
 
 fn plan_id(output: &str) -> &str {
@@ -73,13 +76,19 @@ fn install_is_plan_first_and_preserves_shared_content() {
         &fs::read(roots.state_home.join("plans").join(format!("{id}.json"))).unwrap(),
     )
     .unwrap();
-    assert_eq!(plan["schema_version"], 1);
+    assert_eq!(plan["schema_version"], 2);
     assert_eq!(
         plan["source_bin"],
         roots.source_bin.to_string_lossy().as_ref()
     );
     assert_eq!(plan["binary_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(plan["bundle_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(plan["candidate_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(plan["release_evidence_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        plan["release_evidence_fingerprint"].as_str().unwrap().len(),
+        64
+    );
     assert_eq!(plan["recovery_binary_sha256"], plan["binary_sha256"]);
     assert!(
         plan["backup_root_template"]
@@ -157,7 +166,165 @@ fn install_is_plan_first_and_preserves_shared_content() {
     .unwrap();
     let report: serde_json::Value = serde_json::from_str(&doctor).unwrap();
     assert_eq!(report["status"], "installed");
+    assert_eq!(report["release_evidence"], "valid");
+    assert_eq!(report["certification"], "passed");
+    assert_eq!(report["verifier_login"], "missing");
+    assert_eq!(report["candidate_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(report["managed_files_drifted"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn install_refuses_missing_or_changed_release_evidence() {
+    let (_temp, roots) = fixture();
+    let evidence = roots
+        .source_bin
+        .parent()
+        .unwrap()
+        .join("release-evidence.json");
+    fs::remove_file(&evidence).unwrap();
+    let missing = execute_lifecycle(
+        LifecycleCommand::Install,
+        &LifecycleOptions::default(),
+        &roots,
+    )
+    .unwrap_err();
+    assert!(missing.to_string().contains("release evidence"));
+    assert!(!roots.install_bin.exists());
+
+    write_release_evidence(&roots);
+    let output = execute_lifecycle(
+        LifecycleCommand::Install,
+        &LifecycleOptions::default(),
+        &roots,
+    )
+    .unwrap();
+    fs::write(&evidence, b"{}").unwrap();
+    let changed = execute_lifecycle(
+        LifecycleCommand::Install,
+        &LifecycleOptions {
+            apply: Some(plan_id(&output).to_string()),
+            allow_shared_files: true,
+            ..LifecycleOptions::default()
+        },
+        &roots,
+    )
+    .unwrap_err();
+    assert!(changed.to_string().contains("release evidence"));
+    assert!(!roots.install_bin.exists());
+}
+
+#[test]
+fn install_plan_does_not_create_shared_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let source_bin = base.join("bundle/juno");
+    fs::create_dir_all(source_bin.parent().unwrap()).unwrap();
+    fs::write(&source_bin, b"fake juno binary").unwrap();
+    fs::set_permissions(&source_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let roots = Roots {
+        codex_home: base.join("missing-codex"),
+        state_home: base.join("state"),
+        install_bin: base.join("missing-bin/juno"),
+        source_bin,
+    };
+    write_release_evidence(&roots);
+    let error = execute_lifecycle(
+        LifecycleCommand::Install,
+        &LifecycleOptions::default(),
+        &roots,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("Codex home"));
+    assert!(roots.state_home.is_dir());
+    assert!(!roots.codex_home.exists());
+    assert!(!roots.install_bin.parent().unwrap().exists());
+}
+
+#[test]
+fn install_apply_requires_the_approved_source_path() {
+    let (_temp, roots) = fixture();
+    let output = execute_lifecycle(
+        LifecycleCommand::Install,
+        &LifecycleOptions::default(),
+        &roots,
+    )
+    .unwrap();
+    let alternate = roots.source_bin.parent().unwrap().join("alternate-juno");
+    fs::copy(&roots.source_bin, &alternate).unwrap();
+    fs::set_permissions(&alternate, fs::Permissions::from_mode(0o755)).unwrap();
+    let alternate_roots = Roots {
+        source_bin: alternate,
+        ..roots.clone()
+    };
+    let error = execute_lifecycle(
+        LifecycleCommand::Install,
+        &LifecycleOptions {
+            apply: Some(plan_id(&output).to_string()),
+            allow_shared_files: true,
+            ..LifecycleOptions::default()
+        },
+        &alternate_roots,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("plan roots"));
+    assert!(!roots.install_bin.exists());
+}
+
+#[test]
+fn doctor_reports_invalid_installed_evidence() {
+    let (_temp, roots) = fixture();
+    install(&roots);
+    fs::write(roots.state_home.join("manifest.json"), b"{}").unwrap();
+
+    let output = execute_lifecycle(
+        LifecycleCommand::Doctor,
+        &LifecycleOptions {
+            json: true,
+            ..LifecycleOptions::default()
+        },
+        &roots,
+    )
+    .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(report["status"], "attention");
+    assert_eq!(report["installed"], true);
+    assert_eq!(report["release_evidence"], "invalid");
+    assert!(report["release_evidence_error"].is_string());
+    assert_eq!(report["certification"], "not-available");
+    assert!(
+        report["managed_files_drifted"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("state:manifest.json".into()))
+    );
+}
+
+#[test]
+fn doctor_rejects_a_manifest_with_a_changed_evidence_fingerprint() {
+    let (_temp, roots) = fixture();
+    install(&roots);
+    let manifest_path = roots.state_home.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["release_evidence_fingerprint"] = serde_json::Value::String("0".repeat(64));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let output = execute_lifecycle(
+        LifecycleCommand::Doctor,
+        &LifecycleOptions {
+            json: true,
+            ..LifecycleOptions::default()
+        },
+        &roots,
+    )
+    .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(report["status"], "attention");
+    assert_eq!(report["release_evidence"], "invalid");
 }
 
 #[test]
@@ -229,7 +396,7 @@ fn update_uses_the_new_bundle_and_uninstall_restores_the_baseline() {
     .unwrap();
     install(&roots);
 
-    fs::write(&roots.source_bin, b"new fake juno binary").unwrap();
+    replace_source(&roots, b"new fake juno binary");
     let update_plan = execute_lifecycle(
         LifecycleCommand::Update,
         &LifecycleOptions::default(),
@@ -276,6 +443,46 @@ fn update_uses_the_new_bundle_and_uninstall_restores_the_baseline() {
     );
     assert!(!roots.install_bin.exists());
     assert!(!roots.state_home.join("manifest.json").exists());
+}
+
+#[test]
+fn installed_binary_can_uninstall_without_an_adjacent_sidecar() {
+    let (_temp, roots) = fixture();
+    fs::write(roots.codex_home.join("AGENTS.md"), "before\n").unwrap();
+    install(&roots);
+    let installed_roots = Roots {
+        source_bin: roots.install_bin.clone(),
+        ..roots.clone()
+    };
+    assert!(
+        !installed_roots
+            .source_bin
+            .parent()
+            .unwrap()
+            .join("release-evidence.json")
+            .exists()
+    );
+    let uninstall_plan = execute_lifecycle(
+        LifecycleCommand::Uninstall,
+        &LifecycleOptions::default(),
+        &installed_roots,
+    )
+    .unwrap();
+    execute_lifecycle(
+        LifecycleCommand::Uninstall,
+        &LifecycleOptions {
+            apply: Some(plan_id(&uninstall_plan).to_string()),
+            allow_shared_files: true,
+            ..LifecycleOptions::default()
+        },
+        &installed_roots,
+    )
+    .unwrap();
+    assert!(!roots.install_bin.exists());
+    assert_eq!(
+        fs::read_to_string(roots.codex_home.join("AGENTS.md")).unwrap(),
+        "before\n"
+    );
 }
 
 #[test]
@@ -516,7 +723,7 @@ fn interrupted_manifest_commit_restores_the_previous_manifest() {
     fs::write(roots.codex_home.join("AGENTS.md"), "before\n").unwrap();
     install(&roots);
     let manifest_before = fs::read(roots.state_home.join("manifest.json")).unwrap();
-    fs::write(&roots.source_bin, b"new fake juno binary").unwrap();
+    replace_source(&roots, b"new fake juno binary");
     let update_plan = execute_lifecycle(
         LifecycleCommand::Update,
         &LifecycleOptions::default(),

@@ -1,9 +1,10 @@
+use crate::gates::ReleaseEvidence;
 use crate::secure_fs::{FileState, SecureLock, SecureRoot, hex_sha256};
 use crate::{Catalog, generate_assets};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,9 @@ const CATALOG_SOURCE: &str = include_str!("../config/model-catalog.toml");
 const DEFAULT_DOC_LIMIT: usize = 32 * 1024;
 const MAX_SHARED_FILE: u64 = 4 * 1024 * 1024;
 const MAX_PLAN_FILE: u64 = 16 * 1024 * 1024;
+const MAX_MANIFEST_FILE: u64 = 16 * 1024 * 1024;
 const MAX_JOURNAL_FILE: u64 = 1024 * 1024;
+const MAX_RELEASE_EVIDENCE: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Roots {
@@ -26,7 +29,7 @@ impl Roots {
     pub fn from_environment() -> Result<Self, CommandError> {
         let home =
             env::var_os("HOME").ok_or_else(|| CommandError::Usage("HOME is not set".into()))?;
-        let home = PathBuf::from(home);
+        let home = fs::canonicalize(PathBuf::from(home)).map_err(CommandError::Io)?;
         let codex_home = env::var_os("JUNO_CODEX_HOME")
             .or_else(|| env::var_os("CODEX_HOME"))
             .map(PathBuf::from)
@@ -41,13 +44,60 @@ impl Roots {
             .map(PathBuf::from)
             .map(Ok)
             .unwrap_or_else(|| env::current_exe().map_err(CommandError::Io))?;
-        Ok(Self {
+        let roots = Self {
             codex_home,
             state_home,
             install_bin,
             source_bin,
-        })
+        };
+        validate_roots(&home, &roots)?;
+        Ok(roots)
     }
+}
+
+fn validate_roots(home: &Path, roots: &Roots) -> Result<(), CommandError> {
+    for (label, path) in [
+        ("Codex home", &roots.codex_home),
+        ("Juno state", &roots.state_home),
+        ("install destination", &roots.install_bin),
+    ] {
+        if !safe_path(path) || path == home || !path.starts_with(home) {
+            return Err(CommandError::Usage(format!(
+                "{label} must be a specific path under HOME"
+            )));
+        }
+    }
+    if !safe_path(&roots.source_bin) {
+        return Err(CommandError::Usage(
+            "Juno source binary must use a safe absolute path".into(),
+        ));
+    }
+    let install_root = roots.install_bin.parent().ok_or_else(|| {
+        CommandError::Usage("install destination must have a parent directory".into())
+    })?;
+    if paths_overlap(&roots.codex_home, &roots.state_home)
+        || paths_overlap(&roots.codex_home, install_root)
+        || paths_overlap(&roots.state_home, install_root)
+    {
+        return Err(CommandError::Usage(
+            "Codex, Juno state, and install paths must not overlap".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn safe_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            !matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +165,10 @@ struct Plan {
     binary_sha256: String,
     bundle_sha256: String,
     catalog_sha256: String,
+    candidate_sha256: String,
+    release_evidence_sha256: String,
+    release_evidence_fingerprint: String,
+    release_evidence: ReleaseEvidence,
     recovery_binary_sha256: String,
     backup_root_template: PathBuf,
     codex_home: PathBuf,
@@ -170,6 +224,10 @@ struct Manifest {
     binary_sha256: String,
     bundle_sha256: String,
     catalog_sha256: String,
+    candidate_sha256: String,
+    release_evidence_sha256: String,
+    release_evidence_fingerprint: String,
+    release_evidence: ReleaseEvidence,
     files: BTreeMap<String, ManagedFile>,
 }
 
@@ -212,6 +270,11 @@ pub struct DoctorReport {
     pub installed: bool,
     pub managed_files_ok: usize,
     pub managed_files_drifted: Vec<String>,
+    pub candidate_sha256: Option<String>,
+    pub release_evidence: String,
+    pub release_evidence_error: Option<String>,
+    pub certification: String,
+    pub verifier_login: String,
     pub strict_verification: String,
     pub compatibility: crate::CompatibilityReport,
 }
@@ -237,7 +300,7 @@ pub fn execute_lifecycle(
     match command {
         LifecycleCommand::Install => {
             if let Some(plan_id) = &options.apply {
-                apply_plan(plan_id, "install", options, roots, &state)
+                apply_plan(plan_id, "install", options, roots, &state, false)
             } else {
                 create_desired_plan("install", false, roots, &state)
             }
@@ -253,14 +316,14 @@ pub fn execute_lifecycle(
         }
         LifecycleCommand::Update => {
             if let Some(plan_id) = &options.apply {
-                apply_plan(plan_id, "update", options, roots, &state)
+                apply_plan(plan_id, "update", options, roots, &state, false)
             } else {
                 create_desired_plan("update", true, roots, &state)
             }
         }
         LifecycleCommand::Uninstall => {
             if let Some(plan_id) = &options.apply {
-                apply_plan(plan_id, "uninstall", options, roots, &state)
+                apply_plan(plan_id, "uninstall", options, roots, &state, false)
             } else {
                 create_uninstall_plan(roots, &state)
             }
@@ -291,18 +354,31 @@ fn create_desired_plan(
     roots: &Roots,
     state: &SecureRoot,
 ) -> Result<String, CommandError> {
-    let codex = SecureRoot::create(&roots.codex_home)?;
+    let (release_evidence, release_evidence_sha256) =
+        read_release_evidence_for_source(&roots.source_bin)?;
+    let codex = SecureRoot::open(&roots.codex_home).map_err(|error| {
+        CommandError::Blocked(format!("Codex home is missing or unsafe: {error}"))
+    })?;
     let install_parent = roots
         .install_bin
         .parent()
         .ok_or_else(|| CommandError::Usage("installation path has no parent".into()))?;
-    let install = SecureRoot::create(install_parent)?;
+    let install = SecureRoot::open(install_parent).map_err(|error| {
+        CommandError::Blocked(format!(
+            "install destination directory is missing or unsafe: {error}"
+        ))
+    })?;
     let install_name = roots
         .install_bin
         .file_name()
         .ok_or_else(|| CommandError::Usage("installation path has no file name".into()))?;
     let source_binary = roots.source_bin.clone();
     let source_content = read_nofollow(&source_binary)?;
+    if release_evidence.candidate.binary_sha256 != hex_sha256(&source_content) {
+        return Err(CommandError::Blocked(
+            "release evidence does not match the Juno binary".into(),
+        ));
+    }
     let assets = generate_assets(CATALOG_SOURCE)
         .map_err(|error| CommandError::Invalid(error.to_string()))?;
     let catalog =
@@ -399,12 +475,21 @@ fn create_desired_plan(
     }
 
     let plan = Plan {
-        schema_version: 1,
+        schema_version: 2,
         command: command.into(),
         juno_version: crate::VERSION.into(),
         binary_sha256: hex_sha256(&source_content),
         bundle_sha256: release_bundle_sha256(),
         catalog_sha256: hex_sha256(CATALOG_SOURCE.as_bytes()),
+        candidate_sha256: release_evidence
+            .candidate
+            .fingerprint()
+            .map_err(CommandError::Invalid)?,
+        release_evidence_sha256,
+        release_evidence_fingerprint: release_evidence
+            .fingerprint()
+            .map_err(CommandError::Invalid)?,
+        release_evidence,
         recovery_binary_sha256: hex_sha256(&source_content),
         backup_root_template: roots.state_home.join("transactions/{PLAN_ID}/backups"),
         codex_home: roots.codex_home.clone(),
@@ -513,8 +598,8 @@ fn add_source_operation(
 fn create_uninstall_plan(roots: &Roots, state: &SecureRoot) -> Result<String, CommandError> {
     let manifest = read_manifest(state)?
         .ok_or_else(|| CommandError::Blocked("Juno is not installed".into()))?;
-    let codex = SecureRoot::create(&roots.codex_home)?;
-    let install = SecureRoot::create(
+    let codex = SecureRoot::open(&roots.codex_home)?;
+    let install = SecureRoot::open(
         roots
             .install_bin
             .parent()
@@ -592,12 +677,16 @@ fn create_uninstall_plan(roots: &Roots, state: &SecureRoot) -> Result<String, Co
 
     let source_content = read_nofollow(&roots.source_bin)?;
     let plan = Plan {
-        schema_version: 1,
+        schema_version: 2,
         command: "uninstall".into(),
         juno_version: crate::VERSION.into(),
         binary_sha256: hex_sha256(&source_content),
         bundle_sha256: release_bundle_sha256(),
         catalog_sha256: hex_sha256(CATALOG_SOURCE.as_bytes()),
+        candidate_sha256: manifest.candidate_sha256.clone(),
+        release_evidence_sha256: manifest.release_evidence_sha256.clone(),
+        release_evidence_fingerprint: manifest.release_evidence_fingerprint.clone(),
+        release_evidence: manifest.release_evidence.clone(),
         recovery_binary_sha256: hex_sha256(&source_content),
         backup_root_template: roots.state_home.join("transactions/{PLAN_ID}/backups"),
         codex_home: roots.codex_home.clone(),
@@ -761,8 +850,8 @@ fn create_recovery_plan(
             "journal operation position is invalid".into(),
         ));
     }
-    let codex = SecureRoot::create(&roots.codex_home)?;
-    let install = SecureRoot::create(
+    let codex = SecureRoot::open(&roots.codex_home)?;
+    let install = SecureRoot::open(
         roots
             .install_bin
             .parent()
@@ -824,12 +913,16 @@ fn create_recovery_plan(
         RecoveryStrategy::Rollback => original.operations[..effective_applied].to_vec(),
     };
     let plan = Plan {
-        schema_version: 1,
+        schema_version: 2,
         command: "recover".into(),
         juno_version: original.juno_version,
         binary_sha256: original.binary_sha256,
         bundle_sha256: original.bundle_sha256,
         catalog_sha256: original.catalog_sha256,
+        candidate_sha256: original.candidate_sha256,
+        release_evidence_sha256: original.release_evidence_sha256,
+        release_evidence_fingerprint: original.release_evidence_fingerprint,
+        release_evidence: original.release_evidence,
         recovery_binary_sha256: journal.recovery_binary_sha256.clone(),
         backup_root_template: original.backup_root_template,
         codex_home: roots.codex_home.clone(),
@@ -913,9 +1006,14 @@ fn apply_recovery_plan(
     }
     match authorization.strategy {
         RecoveryStrategy::Rollback => Ok(format!("rolled back plan {}", journal.plan_id)),
-        RecoveryStrategy::Complete => {
-            apply_plan(&journal.plan_id, &original.command, options, roots, state)
-        }
+        RecoveryStrategy::Complete => apply_plan(
+            &journal.plan_id,
+            &original.command,
+            options,
+            roots,
+            state,
+            true,
+        ),
     }
 }
 
@@ -927,8 +1025,8 @@ fn rollback_applied(
     roots: &Roots,
     state: &SecureRoot,
 ) -> Result<(), CommandError> {
-    let codex = SecureRoot::create(&roots.codex_home)?;
-    let install = SecureRoot::create(
+    let codex = SecureRoot::open(&roots.codex_home)?;
+    let install = SecureRoot::open(
         roots
             .install_bin
             .parent()
@@ -1019,6 +1117,7 @@ fn apply_plan(
     options: &LifecycleOptions,
     roots: &Roots,
     state: &SecureRoot,
+    recovery_resume: bool,
 ) -> Result<String, CommandError> {
     let plan = load_plan(state, plan_id)?;
     if plan.command != expected_command {
@@ -1027,6 +1126,7 @@ fn apply_plan(
     if plan.codex_home != roots.codex_home
         || plan.state_home != roots.state_home
         || plan.install_bin != roots.install_bin
+        || !recovery_resume && plan.source_bin != roots.source_bin
     {
         return Err(CommandError::Blocked(
             "plan roots do not match this invocation".into(),
@@ -1067,10 +1167,26 @@ fn apply_plan(
             "catalog changed after approval".into(),
         ));
     }
+    validate_release_binding(&plan)?;
+    if !recovery_resume && matches!(plan.command.as_str(), "install" | "update") {
+        let (current_evidence, current_sha256) =
+            read_release_evidence_for_source(&roots.source_bin)?;
+        if current_sha256 != plan.release_evidence_sha256
+            || current_evidence
+                .candidate
+                .fingerprint()
+                .map_err(CommandError::Invalid)?
+                != plan.candidate_sha256
+        {
+            return Err(CommandError::Blocked(
+                "release evidence changed after approval".into(),
+            ));
+        }
+    }
 
-    let codex = SecureRoot::create(&roots.codex_home)?;
+    let codex = SecureRoot::open(&roots.codex_home)?;
     let install_parent = roots.install_bin.parent().unwrap();
-    let install = SecureRoot::create(install_parent)?;
+    let install = SecureRoot::open(install_parent)?;
     prevalidate_operations(&plan, &codex, &install, &current_binary)?;
     let manifest_relative = Path::new("manifest.json");
     let manifest_before = state.inspect(manifest_relative)?;
@@ -1268,11 +1384,15 @@ fn apply_plan(
         None
     } else {
         let manifest = Manifest {
-            schema_version: 1,
+            schema_version: 2,
             juno_version: plan.juno_version,
             binary_sha256: plan.binary_sha256,
             bundle_sha256: plan.bundle_sha256,
             catalog_sha256: plan.catalog_sha256,
+            candidate_sha256: plan.candidate_sha256,
+            release_evidence_sha256: plan.release_evidence_sha256,
+            release_evidence_fingerprint: plan.release_evidence_fingerprint,
+            release_evidence: plan.release_evidence,
             files: managed,
         };
         Some(
@@ -1365,7 +1485,7 @@ fn prevalidate_operations(
 }
 
 fn doctor(roots: &Roots, state: &SecureRoot) -> Result<DoctorReport, CommandError> {
-    let codex = SecureRoot::create(&roots.codex_home)?;
+    let codex = SecureRoot::open(&roots.codex_home)?;
     let config =
         read_shared_utf8(&codex, Path::new("config.toml"), "Codex config")?.unwrap_or_default();
     let override_present = codex
@@ -1389,10 +1509,17 @@ fn doctor(roots: &Roots, state: &SecureRoot) -> Result<DoctorReport, CommandErro
         current_instruction_chain(instruction_bytes, instruction_limit, &config)?;
     let mut ok = 0;
     let mut drifted = Vec::new();
-    let manifest = read_manifest(state)?;
+    let manifest_present = state.inspect(Path::new("manifest.json"))?.is_some();
+    let (manifest, release_evidence_error) = match read_manifest(state) {
+        Ok(value) => (value, None),
+        Err(error) => {
+            drifted.push("state:manifest.json".into());
+            (None, Some(error.to_string()))
+        }
+    };
     if let Some(manifest) = &manifest {
         let install_parent = roots.install_bin.parent().unwrap();
-        let install = SecureRoot::create(install_parent)?;
+        let install = SecureRoot::open(install_parent)?;
         for (key, file) in &manifest.files {
             let root = match file.root {
                 OperationRoot::Codex => &codex,
@@ -1405,14 +1532,41 @@ fn doctor(roots: &Roots, state: &SecureRoot) -> Result<DoctorReport, CommandErro
         }
     }
     let journal_incomplete = state.inspect(Path::new("journal.json"))?.is_some();
-    let status = if journal_incomplete || !drifted.is_empty() || current_chain_truncated {
+    let status = if journal_incomplete
+        || !drifted.is_empty()
+        || current_chain_truncated
+        || release_evidence_error.is_some()
+    {
         "attention"
     } else if manifest.is_some() {
         "installed"
     } else {
         "not-installed"
     };
-    let compatibility = crate::check_compatibility();
+    let candidate_sha256 = manifest
+        .as_ref()
+        .map(|value| value.candidate_sha256.clone());
+    let release_evidence = if release_evidence_error.is_some() {
+        "invalid"
+    } else if manifest.is_some() {
+        "valid"
+    } else {
+        "missing"
+    };
+    let compatibility = crate::compatibility::check_compatibility_with_evidence(
+        manifest.as_ref().map(|value| &value.release_evidence),
+    );
+    let certification = if compatibility.status == "certified" {
+        "passed"
+    } else {
+        "not-available"
+    };
+    let verifier_login = match state.inspect(Path::new("verifier/home/auth.json")) {
+        Ok(Some(value)) if value.mode & 0o077 == 0 => "ready",
+        Ok(Some(_)) => "unsafe",
+        Ok(None) => "missing",
+        Err(_) => "unsafe",
+    };
     Ok(DoctorReport {
         status: status.into(),
         codex_home: roots.codex_home.clone(),
@@ -1423,9 +1577,14 @@ fn doctor(roots: &Roots, state: &SecureRoot) -> Result<DoctorReport, CommandErro
         current_chain_bytes,
         current_chain_truncated,
         journal_incomplete,
-        installed: manifest.is_some(),
+        installed: manifest_present,
         managed_files_ok: ok,
         managed_files_drifted: drifted,
+        candidate_sha256,
+        release_evidence: release_evidence.into(),
+        release_evidence_error,
+        certification: certification.into(),
+        verifier_login: verifier_login.into(),
         strict_verification: crate::verifier::strict_status(roots),
         compatibility,
     })
@@ -1433,7 +1592,7 @@ fn doctor(roots: &Roots, state: &SecureRoot) -> Result<DoctorReport, CommandErro
 
 fn format_doctor(report: &DoctorReport) -> String {
     format!(
-        "status: {}\neffective instructions: {}\ninstruction bytes: {}/{}\ncurrent chain bytes: {}\ninstruction bytes remaining: {}\ncurrent chain truncated: {}\ninstalled: {}\nmanaged files ok: {}\nmanaged files drifted: {}\ncompatibility: {}\nstrict verification: {}",
+        "status: {}\neffective instructions: {}\ninstruction bytes: {}/{}\ncurrent chain bytes: {}\ninstruction bytes remaining: {}\ncurrent chain truncated: {}\ninstalled: {}\nmanaged files ok: {}\nmanaged files drifted: {}\nrelease evidence: {}\nrelease evidence error: {}\ncertification: {}\nverifier login: {}\ncompatibility: {}\nstrict verification: {}",
         report.status,
         report.effective_instruction_file.display(),
         report.instruction_bytes,
@@ -1444,6 +1603,10 @@ fn format_doctor(report: &DoctorReport) -> String {
         report.installed,
         report.managed_files_ok,
         report.managed_files_drifted.len(),
+        report.release_evidence,
+        report.release_evidence_error.as_deref().unwrap_or("none"),
+        report.certification,
+        report.verifier_login,
         report.compatibility.status,
         report.strict_verification,
     )
@@ -1769,7 +1932,9 @@ fn save_plan(state: &SecureRoot, plan: &Plan) -> Result<String, CommandError> {
         None => &plan.command,
     };
     let mut output = format!(
-        "plan: {plan_id}\nbinary: {}\nbundle: {}\ncatalog: {}\noperations: {}\nconflicts: {}",
+        "plan: {plan_id}\ncandidate: {}\nrelease evidence: {}\nbinary: {}\nbundle: {}\ncatalog: {}\noperations: {}\nconflicts: {}",
+        plan.candidate_sha256,
+        plan.release_evidence_sha256,
         plan.binary_sha256,
         plan.bundle_sha256,
         plan.catalog_sha256,
@@ -1843,6 +2008,7 @@ fn load_plan(state: &SecureRoot, plan_id: &str) -> Result<Plan, CommandError> {
             "plan content does not match its ID".into(),
         ));
     }
+    validate_release_binding(&plan)?;
     Ok(plan)
 }
 
@@ -1863,15 +2029,130 @@ fn read_manifest(state: &SecureRoot) -> Result<Option<Manifest>, CommandError> {
     let Some(file_state) = state.inspect(relative)? else {
         return Ok(None);
     };
-    if file_state.size > MAX_SHARED_FILE {
+    if file_state.size > MAX_MANIFEST_FILE {
         return Err(CommandError::Blocked("manifest is too large".into()));
     }
     let content = state
         .read_bounded(relative, file_state.size)?
         .ok_or_else(|| CommandError::Blocked("manifest disappeared".into()))?;
-    serde_json::from_slice(&content)
-        .map(Some)
-        .map_err(|error| CommandError::Invalid(format!("manifest does not parse: {error}")))
+    let manifest: Manifest = serde_json::from_slice(&content)
+        .map_err(|error| CommandError::Invalid(format!("manifest does not parse: {error}")))?;
+    validate_manifest(&manifest)?;
+    Ok(Some(manifest))
+}
+
+pub(crate) fn installed_release_evidence(
+    roots: &Roots,
+) -> Result<(ReleaseEvidence, String), CommandError> {
+    let state = SecureRoot::create(&roots.state_home)?;
+    let manifest = read_manifest(&state)?
+        .ok_or_else(|| CommandError::Blocked("Juno is not installed".into()))?;
+    Ok((manifest.release_evidence, manifest.release_evidence_sha256))
+}
+
+fn read_release_evidence_for_source(
+    source_binary: &Path,
+) -> Result<(ReleaseEvidence, String), CommandError> {
+    let parent = source_binary
+        .parent()
+        .ok_or_else(|| CommandError::Usage("Juno source binary has no parent directory".into()))?;
+    let path = parent.join("release-evidence.json");
+    let content = read_bounded_nofollow(&path, MAX_RELEASE_EVIDENCE).map_err(|error| {
+        CommandError::Blocked(format!(
+            "release evidence is missing or unsafe at {}: {error}",
+            path.display()
+        ))
+    })?;
+    let evidence: ReleaseEvidence = serde_json::from_slice(&content).map_err(|error| {
+        CommandError::Blocked(format!("release evidence does not parse: {error}"))
+    })?;
+    evidence
+        .validate()
+        .map_err(|error| CommandError::Blocked(format!("release evidence is invalid: {error}")))?;
+    Ok((evidence, hex_sha256(&content)))
+}
+
+fn validate_release_binding(plan: &Plan) -> Result<(), CommandError> {
+    if plan.schema_version != 2
+        || plan.release_evidence_sha256.len() != 64
+        || !plan
+            .release_evidence_sha256
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+        || plan.release_evidence_fingerprint.len() != 64
+        || !plan
+            .release_evidence_fingerprint
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+    {
+        return Err(CommandError::Invalid(
+            "release evidence identity is invalid".into(),
+        ));
+    }
+    plan.release_evidence
+        .validate()
+        .map_err(CommandError::Invalid)?;
+    let evidence_fingerprint = plan
+        .release_evidence
+        .fingerprint()
+        .map_err(CommandError::Invalid)?;
+    let candidate_sha256 = plan
+        .release_evidence
+        .candidate
+        .fingerprint()
+        .map_err(CommandError::Invalid)?;
+    if plan.release_evidence_fingerprint != evidence_fingerprint
+        || plan.candidate_sha256 != candidate_sha256
+        || plan.binary_sha256 != plan.release_evidence.candidate.binary_sha256
+        || plan.bundle_sha256 != plan.release_evidence.candidate.bundle_sha256
+        || plan.catalog_sha256 != plan.release_evidence.candidate.catalog_sha256
+    {
+        return Err(CommandError::Invalid(
+            "release evidence does not match the plan".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_manifest(manifest: &Manifest) -> Result<(), CommandError> {
+    if manifest.schema_version != 2
+        || manifest.release_evidence_sha256.len() != 64
+        || !manifest
+            .release_evidence_sha256
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+        || manifest.release_evidence_fingerprint.len() != 64
+        || !manifest
+            .release_evidence_fingerprint
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+    {
+        return Err(CommandError::Invalid("manifest identity is invalid".into()));
+    }
+    manifest
+        .release_evidence
+        .validate()
+        .map_err(CommandError::Invalid)?;
+    if manifest.release_evidence_fingerprint
+        != manifest
+            .release_evidence
+            .fingerprint()
+            .map_err(CommandError::Invalid)?
+        || manifest.candidate_sha256
+            != manifest
+                .release_evidence
+                .candidate
+                .fingerprint()
+                .map_err(CommandError::Invalid)?
+        || manifest.binary_sha256 != manifest.release_evidence.candidate.binary_sha256
+        || manifest.bundle_sha256 != manifest.release_evidence.candidate.bundle_sha256
+        || manifest.catalog_sha256 != manifest.release_evidence.candidate.catalog_sha256
+    {
+        return Err(CommandError::Invalid(
+            "manifest release evidence does not match its assets".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn read_journal(state: &SecureRoot) -> Result<Option<Journal>, CommandError> {
@@ -1908,6 +2189,24 @@ fn read_nofollow(path: &Path) -> Result<Vec<u8>, CommandError> {
     Ok(content)
 }
 
+fn read_bounded_nofollow(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW_ANY);
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > limit {
+        return Err(io::Error::other("file has unsafe metadata"));
+    }
+    let mut content = Vec::new();
+    Read::by_ref(&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut content)?;
+    if content.len() as u64 > limit {
+        return Err(io::Error::other("file exceeds its read limit"));
+    }
+    Ok(content)
+}
+
 fn read_shared_utf8(
     root: &SecureRoot,
     relative: &Path,
@@ -1935,8 +2234,13 @@ pub(crate) fn release_bundle_sha256() -> String {
         CATALOG_SOURCE.as_bytes(),
         include_bytes!("../config/routing-defaults.toml").as_slice(),
         include_bytes!("../config/compatibility.toml").as_slice(),
+        include_bytes!("../schemas/canary-artifact.schema.json").as_slice(),
+        include_bytes!("../schemas/certification-fixture.schema.json").as_slice(),
+        include_bytes!("../schemas/certification-result.schema.json").as_slice(),
         include_bytes!("../schemas/evidence-packet.schema.json").as_slice(),
+        include_bytes!("../schemas/release-evidence.schema.json").as_slice(),
         include_bytes!("../schemas/verifier-result.schema.json").as_slice(),
+        include_bytes!("../scripts/desktop-certification.applescript").as_slice(),
         include_bytes!("../templates/instructions/routing-policy.md").as_slice(),
         include_bytes!("../templates/agents/scout.md").as_slice(),
         include_bytes!("../templates/agents/surveyor.md").as_slice(),
@@ -2155,6 +2459,28 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
+
+    #[test]
+    fn root_validation_rejects_broad_and_overlapping_targets() {
+        let home = Path::new("/Users/tester");
+        let valid = Roots {
+            codex_home: home.join(".codex"),
+            state_home: home.join("Library/Application Support/Juno"),
+            install_bin: home.join(".local/bin/juno"),
+            source_bin: PathBuf::from("/private/tmp/juno-bundle/juno"),
+        };
+        validate_roots(home, &valid).unwrap();
+        let broad = Roots {
+            codex_home: PathBuf::from("/"),
+            ..valid.clone()
+        };
+        assert!(validate_roots(home, &broad).is_err());
+        let overlapping = Roots {
+            state_home: valid.codex_home.join("state"),
+            ..valid
+        };
+        assert!(validate_roots(home, &overlapping).is_err());
+    }
 
     #[test]
     fn routing_markers_are_replaced_without_touching_other_text() {

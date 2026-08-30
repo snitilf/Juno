@@ -4,7 +4,23 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
-cargo build --locked --offline --release
+if [ "$#" -ne 2 ]; then
+    echo "usage: $0 FROZEN_BINARY RELEASE_EVIDENCE" >&2
+    exit 2
+fi
+
+binary=$1
+evidence=$2
+case "$binary:$evidence" in
+    /*:/*) ;;
+    *)
+        echo "bundle inputs must use absolute paths" >&2
+        exit 2
+        ;;
+esac
+
+cargo run --locked --offline --quiet --example release-gates -- \
+    validate-release --binary "$binary" --evidence "$evidence"
 
 version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -1)
 case "$version" in
@@ -23,7 +39,7 @@ if [ -e "$destination" ]; then
     exit 1
 fi
 
-mkdir -p "$stage/config" "$stage/schemas" "$stage/templates"
+mkdir -p "$stage/config" "$stage/schemas" "$stage/scripts" "$stage/templates"
 cleanup() {
     if [ -d "$stage" ]; then
         rm -r "$stage"
@@ -31,11 +47,15 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-cp target/release/juno "$stage/juno"
+cp "$binary" "$stage/juno"
+cp "$evidence" "$stage/release-evidence.json"
 cp LICENSE README.md "$stage/"
 cp config/model-catalog.toml config/routing-defaults.toml config/compatibility.toml "$stage/config/"
-cp schemas/evidence-packet.schema.json schemas/verifier-result.schema.json "$stage/schemas/"
+cp schemas/*.json "$stage/schemas/"
+cp scripts/desktop-certification.applescript "$stage/scripts/"
 cp -R templates/agents templates/instructions "$stage/templates/"
+chmod 755 "$stage/juno"
+chmod 644 "$stage/release-evidence.json"
 
 find "$stage" -type f ! -name SHA256SUMS -print0 \
     | sort -z \

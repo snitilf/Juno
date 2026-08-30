@@ -17,7 +17,7 @@ Strict verification stays disabled until isolation and non-mutation checks pass.
 ## Readiness
 
 Juno is not ready to install.
-The asset generator, lifecycle binary, snapshot builder, and release gate tools are implemented.
+The asset generator, lifecycle binary, snapshot builder, and release evidence checks are implemented.
 Client certification and strict canaries have not run.
 
 ## Layout

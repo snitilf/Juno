@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sealed_on",
+    "candidate",
+    "canaries",
+    "certifications",
+    "independent_review"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "sealed_on": { "type": "string", "format": "date" },
+    "candidate": { "$ref": "#/$defs/candidate" },
+    "canaries": { "$ref": "#/$defs/canaries" },
+    "certifications": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cli", "desktop"],
+      "properties": {
+        "cli": { "$ref": "#/$defs/certification" },
+        "desktop": { "$ref": "#/$defs/certification" }
+      }
+    },
+    "independent_review": { "$ref": "#/$defs/review" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "verified_on",
+        "frozen_at_unix",
+        "source_commit",
+        "source_clean",
+        "juno_version",
+        "binary_sha256",
+        "bundle_sha256",
+        "catalog_sha256",
+        "routing_sha256",
+        "compatibility_sha256"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "verified_on": { "type": "string", "format": "date" },
+        "frozen_at_unix": { "type": "integer", "minimum": 1 },
+        "source_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{40}$"
+        },
+        "source_clean": { "const": true },
+        "juno_version": { "type": "string", "minLength": 1 },
+        "binary_sha256": { "$ref": "#/$defs/sha256" },
+        "bundle_sha256": { "$ref": "#/$defs/sha256" },
+        "catalog_sha256": { "$ref": "#/$defs/sha256" },
+        "routing_sha256": { "$ref": "#/$defs/sha256" },
+        "compatibility_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "canary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "evidence_sha256", "summary"],
+      "properties": {
+        "passed": { "const": true },
+        "evidence_sha256": { "$ref": "#/$defs/sha256" },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 4096 }
+      }
+    },
+    "canaries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "verified_on",
+        "candidate_sha256",
+        "juno_sha256",
+        "codex_sha256",
+        "execution_context",
+        "checks"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "verified_on": { "type": "string", "format": "date" },
+        "candidate_sha256": { "$ref": "#/$defs/sha256" },
+        "juno_sha256": { "$ref": "#/$defs/sha256" },
+        "codex_sha256": { "$ref": "#/$defs/sha256" },
+        "execution_context": { "const": "unsandboxed-dedicated-account" },
+        "checks": {
+          "type": "object",
+          "minProperties": 15,
+          "maxProperties": 15,
+          "additionalProperties": { "$ref": "#/$defs/canary" }
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required_instruction_passes",
+        "required_instruction_total",
+        "seeded_defects_detected",
+        "seeded_defect_total",
+        "critical_or_high_escapes",
+        "unauthorized_changes",
+        "routing_correct",
+        "routing_total",
+        "clean_false_positives",
+        "clean_total"
+      ],
+      "properties": {
+        "required_instruction_passes": { "const": 120 },
+        "required_instruction_total": { "const": 120 },
+        "seeded_defects_detected": { "const": 120 },
+        "seeded_defect_total": { "const": 120 },
+        "critical_or_high_escapes": { "const": 0 },
+        "unauthorized_changes": { "const": 0 },
+        "routing_correct": { "type": "integer", "minimum": 119, "maximum": 120 },
+        "routing_total": { "const": 120 },
+        "clean_false_positives": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "clean_total": { "const": 120 }
+      }
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "passed",
+        "failures",
+        "routing_wilson_lower",
+        "false_positive_wilson_upper"
+      ],
+      "properties": {
+        "passed": { "const": true },
+        "failures": { "type": "array", "maxItems": 0 },
+        "routing_wilson_lower": { "type": "number", "minimum": 0.95 },
+        "false_positive_wilson_upper": { "type": "number", "maximum": 0.05 }
+      }
+    },
+    "certification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client",
+        "candidate_sha256",
+        "corpus_sha256",
+        "run_sha256",
+        "environment_sha256",
+        "raw_artifacts_sha256",
+        "client_target_sha256",
+        "counts",
+        "report"
+      ],
+      "properties": {
+        "client": { "enum": ["cli", "desktop"] },
+        "candidate_sha256": { "$ref": "#/$defs/sha256" },
+        "corpus_sha256": { "$ref": "#/$defs/sha256" },
+        "run_sha256": { "$ref": "#/$defs/sha256" },
+        "environment_sha256": { "$ref": "#/$defs/sha256" },
+        "raw_artifacts_sha256": { "$ref": "#/$defs/sha256" },
+        "client_target_sha256": { "$ref": "#/$defs/sha256" },
+        "counts": { "$ref": "#/$defs/counts" },
+        "report": { "$ref": "#/$defs/report" }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_sha256",
+        "verifier_role",
+        "verdict",
+        "packet_sha256",
+        "snapshot_sha256",
+        "result_sha256"
+      ],
+      "properties": {
+        "candidate_sha256": { "$ref": "#/$defs/sha256" },
+        "verifier_role": { "const": "heavy_verifier" },
+        "verdict": { "const": "CONFIRMED" },
+        "packet_sha256": { "$ref": "#/$defs/sha256" },
+        "snapshot_sha256": { "$ref": "#/$defs/sha256" },
+        "result_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

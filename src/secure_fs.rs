@@ -40,7 +40,13 @@ impl Drop for SecureLock {
 
 impl SecureRoot {
     pub fn create(path: &Path) -> io::Result<Self> {
-        let fd = open_or_create_absolute_directory(path)?;
+        let fd = open_absolute_directory(path, true)?;
+        validate_trusted_directory(fd.as_raw_fd())?;
+        Ok(Self { fd })
+    }
+
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let fd = open_absolute_directory(path, false)?;
         validate_trusted_directory(fd.as_raw_fd())?;
         Ok(Self { fd })
     }
@@ -489,7 +495,7 @@ fn state_at(parent: RawFd, name: &CString) -> io::Result<Option<FileState>> {
     state_from_file(&mut file).map(Some)
 }
 
-fn open_or_create_absolute_directory(path: &Path) -> io::Result<OwnedFd> {
+fn open_absolute_directory(path: &Path, create: bool) -> io::Result<OwnedFd> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -514,12 +520,14 @@ fn open_or_create_absolute_directory(path: &Path) -> io::Result<OwnedFd> {
         let name = CString::new(value.as_bytes()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "root component contains NUL")
         })?;
-        let made = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
-        if made < 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
-            return Err(io::Error::last_os_error());
-        }
-        if made == 0 {
-            fsync_fd(directory.as_raw_fd())?;
+        if create {
+            let made = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            if made < 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
+                return Err(io::Error::last_os_error());
+            }
+            if made == 0 {
+                fsync_fd(directory.as_raw_fd())?;
+            }
         }
         let next = unsafe {
             libc::openat(

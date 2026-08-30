@@ -1,20 +1,24 @@
-use crate::gates::{CanaryRecord, CandidateRecord};
 use crate::secure_fs::{SecureRoot, hex_sha256};
-use crate::{Catalog, Roots, Snapshot, create_snapshot};
+use crate::{Catalog, Roots, create_snapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 const CATALOG_SOURCE: &str = include_str!("../config/model-catalog.toml");
 const COMPATIBILITY_SOURCE: &str = include_str!("../config/compatibility.toml");
 const ROUTING_DEFAULTS_SOURCE: &str = include_str!("../config/routing-defaults.toml");
 const RESULT_SCHEMA: &str = include_str!("../schemas/verifier-result.schema.json");
 const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -23,15 +27,6 @@ pub struct EvidencePacket {
     pub paths: Vec<String>,
     pub claimed_checks: Vec<String>,
     pub constraints: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct FrozenEvidencePacket<'a> {
-    snapshot_sha256: &'a str,
-    requirement: &'a str,
-    paths: &'a [String],
-    claimed_checks: &'a [String],
-    constraints: &'a [String],
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -78,12 +73,46 @@ pub struct VerifyRequest {
     pub json: bool,
 }
 
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct StrictProbeRequest {
+    pub codex_bin: PathBuf,
+    pub verifier_home: PathBuf,
+    pub runs_root: PathBuf,
+    pub repo: PathBuf,
+    pub output_schema: Vec<u8>,
+    pub prompt: String,
+    pub required_paths: Vec<String>,
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct StrictProbeResult {
+    pub snapshot_sha256: String,
+    pub output: Vec<u8>,
+    pub proxy_hosts: Vec<String>,
+}
+
 #[derive(Debug)]
 struct LaunchSpec {
     program: PathBuf,
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
     cwd: PathBuf,
+}
+
+struct StrictLaunchFiles<'a> {
+    profile: &'a Path,
+    schema: &'a Path,
+    result: &'a Path,
+}
+
+struct ServiceProxy {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<String>>>,
+    error: Arc<Mutex<Option<String>>>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,45 +133,67 @@ struct RoutingDefaults {
 
 #[derive(Debug, Deserialize)]
 struct StrictVerificationDefaults {
-    status: String,
-    enabled: bool,
     required_canaries: Vec<String>,
 }
 
 pub fn verifier_login(roots: &Roots) -> Result<String, String> {
+    require_unsandboxed_parent()?;
     crate::lifecycle::ensure_verifier_allowed(roots).map_err(|error| error.to_string())?;
-    nested_sandbox_probe()?;
+    let (evidence, _) = crate::lifecycle::installed_release_evidence(roots)
+        .map_err(|error| format!("BLOCKED: {error}"))?;
+    if crate::compatibility::check_compatibility_with_evidence(Some(&evidence)).status
+        != "certified"
+    {
+        return Err("BLOCKED: this Juno release is not certified for these clients".into());
+    }
     let state = SecureRoot::create(&roots.state_home).map_err(|error| error.to_string())?;
     state
         .ensure_directory(Path::new("verifier/home/tmp"), 0o700)
         .map_err(|error| error.to_string())?;
     let verifier_home = roots.state_home.join("verifier/home");
     prepare_verifier_home(&verifier_home, None).map_err(|error| error.to_string())?;
+    let login_relative = PathBuf::from(format!("verifier/login-{}", std::process::id()));
+    state
+        .ensure_directory(&login_relative.join("tmp"), 0o700)
+        .map_err(|error| error.to_string())?;
+    let login_home = roots.state_home.join(&login_relative);
+    prepare_verifier_home(&login_home, None).map_err(|error| error.to_string())?;
     let codex = codex_path().map_err(|error| error.to_string())?;
-    let status = isolated_command(&codex, &verifier_home)
+    let status = isolated_command(&codex, &login_home)
         .arg("login")
         .status()
         .map_err(|error| error.to_string())?;
     if !status.success() {
-        return Err(format!("Codex login failed with {status}"));
+        return Err(format!(
+            "Codex login failed with {status}; private staging state remains at {}",
+            login_home.display()
+        ));
     }
+    move_private_auth(&login_home, &verifier_home).map_err(|error| error.to_string())?;
+    fs::remove_dir_all(&login_home).map_err(|error| {
+        format!(
+            "verifier login succeeded, but credential-free staging cleanup failed at {}: {error}",
+            login_home.display()
+        )
+    })?;
     Ok(format!(
-        "verifier login stored under {}\nstrict verification stays unavailable until the required canaries pass",
+        "verifier login stored under {}\nrun `juno doctor` to confirm strict verification is available",
         verifier_home.display()
     ))
 }
 
 pub fn verify(request: &VerifyRequest, roots: &Roots) -> Result<String, String> {
-    crate::lifecycle::ensure_verifier_allowed(roots).map_err(|error| error.to_string())?;
     if std::env::var_os("JUNO_STRICT_ACTIVE").is_some() {
         return Err("BLOCKED: strict verification cannot recurse".into());
     }
-    nested_sandbox_probe()?;
-    if crate::check_compatibility().status != "certified" {
+    require_unsandboxed_parent()?;
+    crate::lifecycle::ensure_verifier_allowed(roots).map_err(|error| error.to_string())?;
+    let (evidence, _) = crate::lifecycle::installed_release_evidence(roots)
+        .map_err(|error| format!("BLOCKED: {error}"))?;
+    if crate::compatibility::check_compatibility_with_evidence(Some(&evidence)).status
+        != "certified"
+    {
         return Err("BLOCKED: this Codex CLI and desktop pair is not certified".into());
-    }
-    if !strict_verification_enabled()? {
-        return Err("BLOCKED: strict verification has not passed its evaluation".into());
     }
     let codex = codex_path().map_err(|error| error.to_string())?;
     let codex_content = read_nofollow(&codex).map_err(|error| error.to_string())?;
@@ -153,13 +204,14 @@ pub fn verify(request: &VerifyRequest, roots: &Roots) -> Result<String, String> 
     );
     let verifier_root = roots.state_home.join("verifier");
     let state = SecureRoot::create(&roots.state_home).map_err(|error| error.to_string())?;
-    let (candidate, canaries) = read_gate_records(&state)?;
+    let candidate = &evidence.candidate;
+    let canaries = &evidence.canaries;
     let required_canaries = required_canaries()?;
     if candidate.binary_sha256 != juno_hash
         || canaries.juno_sha256 != juno_hash
         || canaries.codex_sha256 != codex_hash
         || canaries.passed_names() != required_canaries.iter().cloned().collect::<BTreeSet<_>>()
-        || canaries.validate(&candidate).is_err()
+        || canaries.validate(candidate).is_err()
     {
         return Err("BLOCKED: strict canaries have not passed for this Codex binary".into());
     }
@@ -177,10 +229,73 @@ pub fn verify(request: &VerifyRequest, roots: &Roots) -> Result<String, String> 
     let runs = verifier_root.join("runs");
     fs::set_permissions(&runs, fs::Permissions::from_mode(0o700))
         .map_err(|error| error.to_string())?;
-    let snapshot = create_snapshot(&request.repo, &runs).map_err(|error| error.to_string())?;
-    for path in &packet.paths {
-        fs::symlink_metadata(snapshot.root.join(path))
-            .map_err(|_| format!("BLOCKED: evidence path is not in the snapshot: {path}"))?;
+    let probe = execute_strict_core(&StrictProbeRequest {
+        codex_bin: codex,
+        verifier_home: home,
+        runs_root: runs,
+        repo: request.repo.clone(),
+        output_schema: RESULT_SCHEMA.as_bytes().to_vec(),
+        prompt: verifier_prompt_without_snapshot(&packet),
+        required_paths: packet.paths.clone(),
+    })?;
+    let result = String::from_utf8(probe.output)
+        .map_err(|_| "BLOCKED: verifier result is not UTF-8".to_string())?;
+    let parsed: VerifierResult =
+        serde_json::from_str(&result).map_err(|error| error.to_string())?;
+    validate_result(&parsed)?;
+    if request.json {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "snapshot_sha256": probe.snapshot_sha256,
+            "result": parsed,
+        }))
+        .map_err(|error| error.to_string())
+    } else {
+        Ok(result)
+    }
+}
+
+#[doc(hidden)]
+pub fn execute_strict_probe(request: &StrictProbeRequest) -> Result<StrictProbeResult, String> {
+    require_unsandboxed_parent()?;
+    execute_strict_core(request)
+}
+
+fn execute_strict_core(request: &StrictProbeRequest) -> Result<StrictProbeResult, String> {
+    for path in [
+        &request.codex_bin,
+        &request.verifier_home,
+        &request.runs_root,
+        &request.repo,
+    ] {
+        if !path.is_absolute() {
+            return Err("BLOCKED: strict probe paths must be absolute".into());
+        }
+    }
+    read_bounded_nofollow(&request.codex_bin, 512 * 1024 * 1024)
+        .map_err(|error| format!("BLOCKED: Codex binary is unsafe: {error}"))?;
+    private_regular_metadata(&request.verifier_home.join("auth.json"))
+        .map_err(|_| "BLOCKED: dedicated verifier login is missing or unsafe".to_string())?;
+    if request.output_schema.is_empty() || request.output_schema.len() > 1024 * 1024 {
+        return Err("BLOCKED: strict output schema is invalid".into());
+    }
+    serde_json::from_slice::<serde_json::Value>(&request.output_schema)
+        .map_err(|error| format!("BLOCKED: strict output schema does not parse: {error}"))?;
+    ensure_private_directory(&request.verifier_home)?;
+    ensure_private_directory(&request.runs_root)?;
+    let snapshot =
+        create_snapshot(&request.repo, &request.runs_root).map_err(|error| error.to_string())?;
+    for path in &request.required_paths {
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || fs::symlink_metadata(snapshot.root.join(relative)).is_err()
+        {
+            return Err(format!(
+                "BLOCKED: evidence path is not in the snapshot: {path}"
+            ));
+        }
     }
     make_snapshot_read_only(&snapshot.root).map_err(|error| error.to_string())?;
     let run_root = snapshot
@@ -193,64 +308,63 @@ pub fn verify(request: &VerifyRequest, roots: &Roots) -> Result<String, String> 
     ensure_neutral(&neutral)?;
     let result_schema = run_root.join("result-schema.json");
     let result_path = run_root.join("result.json");
-    fs::write(&result_schema, RESULT_SCHEMA).map_err(|error| error.to_string())?;
-    let packet_path = run_root.join("evidence.json");
-    fs::write(
-        &packet_path,
-        serde_json::to_vec_pretty(&FrozenEvidencePacket {
-            snapshot_sha256: &snapshot.manifest_sha256,
-            requirement: &packet.requirement,
-            paths: &packet.paths,
-            claimed_checks: &packet.claimed_checks,
-            constraints: &packet.constraints,
-        })
-        .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    let prompt = verifier_prompt(&snapshot, &packet);
-    prepare_verifier_home(&home, Some(&snapshot.root)).map_err(|error| error.to_string())?;
+    write_private(&result_schema, &request.output_schema).map_err(|error| error.to_string())?;
+    prepare_verifier_home(&request.verifier_home, Some(&snapshot.root))
+        .map_err(|error| error.to_string())?;
+    let mut proxy = ServiceProxy::start()?;
     let profile = run_root.join("outer.sb");
-    fs::write(
+    write_private(
         &profile,
-        outer_profile(&codex, &home, &run_root, &snapshot.root),
+        outer_profile(
+            &request.codex_bin,
+            &request.verifier_home,
+            &run_root,
+            &snapshot.root,
+            proxy.address,
+        )
+        .as_bytes(),
     )
     .map_err(|error| error.to_string())?;
+    let prompt = request
+        .prompt
+        .replace("{SNAPSHOT}", &snapshot.root.display().to_string())
+        .replace("{SNAPSHOT_SHA256}", &snapshot.manifest_sha256)
+        .replace("{SERVICE_PROXY}", &format!("http://{}", proxy.address));
     let spec = launch_spec(
-        &codex,
-        &home,
+        &request.codex_bin,
+        &request.verifier_home,
         &neutral,
-        &profile,
-        &result_schema,
-        &result_path,
+        StrictLaunchFiles {
+            profile: &profile,
+            schema: &result_schema,
+            result: &result_path,
+        },
         &prompt,
+        proxy.address,
     )?;
     run_bounded(&spec)?;
-    crate::snapshot::verify_snapshot(&snapshot).map_err(|error| error.to_string())?;
-    let result = String::from_utf8(
-        read_bounded_nofollow(&result_path, OUTPUT_LIMIT)
-            .map_err(|error| format!("BLOCKED: verifier result is unsafe: {error}"))?,
-    )
-    .map_err(|_| "BLOCKED: verifier result is not UTF-8".to_string())?;
-    let parsed: VerifierResult =
-        serde_json::from_str(&result).map_err(|error| error.to_string())?;
-    validate_result(&parsed)?;
-    if request.json {
-        serde_json::to_string_pretty(&serde_json::json!({
-            "snapshot_sha256": snapshot.manifest_sha256,
-            "result": parsed,
-        }))
-        .map_err(|error| error.to_string())
-    } else {
-        Ok(result)
+    let proxy_hosts = proxy.finish()?;
+    if proxy_hosts.is_empty() || proxy_hosts.iter().any(|host| !allowed_service_host(host)) {
+        return Err("BLOCKED: Codex service proxy containment was not proven".into());
     }
+    crate::snapshot::verify_snapshot(&snapshot).map_err(|error| error.to_string())?;
+    let output = read_bounded_nofollow(&result_path, OUTPUT_LIMIT)
+        .map_err(|error| format!("BLOCKED: verifier result is unsafe: {error}"))?;
+    Ok(StrictProbeResult {
+        snapshot_sha256: snapshot.manifest_sha256,
+        output,
+        proxy_hosts,
+    })
 }
 
 pub(crate) fn strict_status(roots: &Roots) -> String {
-    if crate::check_compatibility().status != "certified" {
+    let Ok((evidence, _)) = crate::lifecycle::installed_release_evidence(roots) else {
+        return "unavailable: release evidence missing".into();
+    };
+    if crate::compatibility::check_compatibility_with_evidence(Some(&evidence)).status
+        != "certified"
+    {
         return "unavailable: clients not certified".into();
-    }
-    if strict_verification_enabled() != Ok(true) {
-        return "unavailable: strict evaluation not passed".into();
     }
     let Ok(codex) = codex_path() else {
         return "unavailable: incompatible Codex binary".into();
@@ -261,12 +375,8 @@ pub(crate) fn strict_status(roots: &Roots) -> String {
     let Ok(juno_content) = read_nofollow(&roots.source_bin) else {
         return "unavailable: unreadable Juno binary".into();
     };
-    let Ok(state) = SecureRoot::create(&roots.state_home) else {
-        return "unavailable: unsafe verifier state".into();
-    };
-    let Ok((candidate, canaries)) = read_gate_records(&state) else {
-        return "unavailable: canaries not passed".into();
-    };
+    let candidate = &evidence.candidate;
+    let canaries = &evidence.canaries;
     let Ok(required_canaries) = required_canaries() else {
         return "unavailable: invalid canary contract".into();
     };
@@ -274,22 +384,22 @@ pub(crate) fn strict_status(roots: &Roots) -> String {
         && canaries.juno_sha256 == hex_sha256(&juno_content)
         && canaries.codex_sha256 == hex_sha256(&content)
         && canaries.passed_names() == required_canaries.into_iter().collect::<BTreeSet<_>>()
-        && canaries.validate(&candidate).is_ok()
+        && canaries.validate(candidate).is_ok()
     {
-        "available".into()
+        if private_regular_metadata(&roots.state_home.join("verifier/home/auth.json")).is_ok() {
+            "available".into()
+        } else {
+            "login-required".into()
+        }
     } else {
         "unavailable: stale canaries".into()
     }
 }
 
 fn read_packet(path: &Path) -> Result<EvidencePacket, String> {
-    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-    if metadata.len() > 1024 * 1024 {
-        return Err("evidence packet exceeds 1 MiB".into());
-    }
+    let content = read_bounded_nofollow(path, 1024 * 1024).map_err(|error| error.to_string())?;
     let packet: EvidencePacket =
-        serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
+        serde_json::from_slice(&content).map_err(|error| error.to_string())?;
     if packet.requirement.is_empty()
         || packet.requirement.len() > 20_000
         || packet.paths.len() > 200
@@ -430,7 +540,7 @@ fn codex_path() -> io::Result<PathBuf> {
     Ok(compatibility.standalone_cli.path)
 }
 
-fn nested_sandbox_probe() -> Result<(), String> {
+fn require_unsandboxed_parent() -> Result<(), String> {
     let status = Command::new("/usr/bin/sandbox-exec")
         .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
         .status()
@@ -439,28 +549,6 @@ fn nested_sandbox_probe() -> Result<(), String> {
         return Err("BLOCKED: strict verification must start outside an existing sandbox".into());
     }
     Ok(())
-}
-
-fn read_gate_records(state: &SecureRoot) -> Result<(CandidateRecord, CanaryRecord), String> {
-    let candidate_content = state
-        .read_bounded(Path::new("release/candidate.json"), 1024 * 1024)
-        .map_err(|_| "BLOCKED: candidate record is unreadable".to_string())?
-        .ok_or_else(|| "BLOCKED: candidate record is missing".to_string())?;
-    let canary_content = state
-        .read_bounded(Path::new("verifier/canaries.json"), 1024 * 1024)
-        .map_err(|_| "BLOCKED: strict canary record is unreadable".to_string())?
-        .ok_or_else(|| "BLOCKED: strict canary record is missing".to_string())?;
-    let candidate: CandidateRecord = serde_json::from_slice(&candidate_content)
-        .map_err(|error| format!("BLOCKED: candidate record is invalid: {error}"))?;
-    let canaries: CanaryRecord = serde_json::from_slice(&canary_content)
-        .map_err(|error| format!("BLOCKED: strict canary record is invalid: {error}"))?;
-    candidate
-        .validate()
-        .map_err(|error| format!("BLOCKED: candidate record is invalid: {error}"))?;
-    canaries
-        .validate(&candidate)
-        .map_err(|error| format!("BLOCKED: strict canary record is invalid: {error}"))?;
-    Ok((candidate, canaries))
 }
 
 fn required_canaries() -> Result<Vec<String>, String> {
@@ -480,12 +568,6 @@ fn required_canaries() -> Result<Vec<String>, String> {
     Ok(defaults.strict_verification.required_canaries)
 }
 
-fn strict_verification_enabled() -> Result<bool, String> {
-    let defaults: RoutingDefaults =
-        toml::from_str(ROUTING_DEFAULTS_SOURCE).map_err(|error| error.to_string())?;
-    Ok(defaults.strict_verification.enabled && defaults.strict_verification.status == "passed")
-}
-
 fn ensure_neutral(path: &Path) -> Result<(), String> {
     for forbidden in [".git", "AGENTS.md", "AGENTS.override.md", ".codex"] {
         if path.join(forbidden).exists() {
@@ -495,11 +577,9 @@ fn ensure_neutral(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn verifier_prompt(snapshot: &Snapshot, packet: &EvidencePacket) -> String {
+fn verifier_prompt_without_snapshot(packet: &EvidencePacket) -> String {
     format!(
-        "Act only as a verifier. Do not repair files. Review the frozen repository at {}. The snapshot manifest is {}. Requirement: {}\nRelevant paths: {}\nClaimed checks: {}\nConstraints: {}\nReturn only the required JSON result.",
-        snapshot.root.display(),
-        snapshot.manifest_sha256,
+        "Act only as a verifier. Do not repair files. Review the frozen repository at {{SNAPSHOT}}. The snapshot manifest is {{SNAPSHOT_SHA256}}. Requirement: {}\nRelevant paths: {}\nClaimed checks: {}\nConstraints: {}\nReturn only the required JSON result.",
         packet.requirement,
         packet.paths.join(", "),
         packet.claimed_checks.join(", "),
@@ -507,23 +587,36 @@ fn verifier_prompt(snapshot: &Snapshot, packet: &EvidencePacket) -> String {
     )
 }
 
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(format!(
+            "BLOCKED: strict directory is unsafe: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn launch_spec(
     codex: &Path,
     home: &Path,
     neutral: &Path,
-    profile: &Path,
-    schema: &Path,
-    result: &Path,
+    files: StrictLaunchFiles<'_>,
     prompt: &str,
+    proxy: SocketAddr,
 ) -> Result<LaunchSpec, String> {
-    if !neutral.is_absolute() || !schema.is_absolute() || !result.is_absolute() {
+    if !neutral.is_absolute() || !files.schema.is_absolute() || !files.result.is_absolute() {
         return Err("BLOCKED: strict launch paths must be absolute".into());
     }
     Ok(LaunchSpec {
         program: PathBuf::from("/usr/bin/sandbox-exec"),
         arguments: vec![
             "-f".into(),
-            profile.display().to_string(),
+            files.profile.display().to_string(),
             codex.display().to_string(),
             "exec".into(),
             "--skip-git-repo-check".into(),
@@ -532,33 +625,42 @@ fn launch_spec(
             "--ephemeral".into(),
             "--json".into(),
             "--output-schema".into(),
-            schema.display().to_string(),
+            files.schema.display().to_string(),
             "--output-last-message".into(),
-            result.display().to_string(),
+            files.result.display().to_string(),
             "-C".into(),
             neutral.display().to_string(),
             prompt.into(),
         ],
-        environment: isolated_environment(home),
+        environment: isolated_environment(home, Some(proxy)),
         cwd: neutral.to_path_buf(),
     })
 }
 
-fn isolated_environment(home: &Path) -> Vec<(String, String)> {
-    vec![
+fn isolated_environment(home: &Path, proxy: Option<SocketAddr>) -> Vec<(String, String)> {
+    let mut environment = vec![
         ("CODEX_HOME".into(), home.display().to_string()),
         ("HOME".into(), home.display().to_string()),
         ("PATH".into(), "/opt/homebrew/bin:/usr/bin:/bin".into()),
         ("LANG".into(), "en_US.UTF-8".into()),
         ("TMPDIR".into(), home.join("tmp").display().to_string()),
         ("JUNO_STRICT_ACTIVE".into(), "1".into()),
-    ]
+    ];
+    if let Some(proxy) = proxy {
+        let url = format!("http://{proxy}");
+        environment.extend([
+            ("HTTP_PROXY".into(), url.clone()),
+            ("HTTPS_PROXY".into(), url.clone()),
+            ("ALL_PROXY".into(), url),
+        ]);
+    }
+    environment
 }
 
 fn isolated_command(program: &Path, home: &Path) -> Command {
     let mut command = Command::new(program);
     command.env_clear();
-    for (key, value) in isolated_environment(home) {
+    for (key, value) in isolated_environment(home, None) {
         command.env(key, value);
     }
     command
@@ -580,7 +682,18 @@ fn run_bounded(spec: &LaunchSpec) -> Result<(), String> {
     let stderr = child.stderr.take().unwrap();
     let stdout_thread = thread::spawn(move || bounded_read(stdout, OUTPUT_LIMIT));
     let stderr_thread = thread::spawn(move || bounded_read(stderr, OUTPUT_LIMIT));
-    let status = child.wait().map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
+        if started.elapsed() >= PROCESS_TIMEOUT {
+            child.kill().map_err(|error| error.to_string())?;
+            let _ = child.wait();
+            return Err("BLOCKED: verifier process exceeded its time limit".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
     let _stdout = stdout_thread
         .join()
         .map_err(|_| "verifier stdout reader failed".to_string())?
@@ -607,13 +720,209 @@ fn bounded_read(mut reader: impl Read, limit: u64) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
-fn outer_profile(codex: &Path, home: &Path, run: &Path, snapshot: &Path) -> String {
+impl ServiceProxy {
+    fn start() -> Result<Self, String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("BLOCKED: cannot bind the service proxy: {error}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("BLOCKED: cannot configure the service proxy: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("BLOCKED: cannot inspect the service proxy: {error}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let error = Arc::new(Mutex::new(None));
+        let thread_stop = Arc::clone(&stop);
+        let thread_requests = Arc::clone(&requests);
+        let thread_error = Arc::clone(&error);
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let requests = Arc::clone(&thread_requests);
+                        thread::spawn(move || {
+                            let _ = handle_service_proxy_connection(stream, &requests);
+                        });
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        if let Ok(mut value) = thread_error.lock() {
+                            *value = Some(error.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            address,
+            stop,
+            requests,
+            error,
+            thread: Some(thread),
+        })
+    }
+
+    fn finish(&mut self) -> Result<Vec<String>, String> {
+        self.stop();
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| "BLOCKED: service proxy thread failed".to_string())?;
+        }
+        if let Some(error) = self
+            .error
+            .lock()
+            .map_err(|_| "BLOCKED: service proxy state failed".to_string())?
+            .clone()
+        {
+            return Err(format!("BLOCKED: service proxy failed: {error}"));
+        }
+        self.requests
+            .lock()
+            .map_err(|_| "BLOCKED: service proxy log failed".to_string())
+            .map(|value| value.clone())
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.address);
+    }
+}
+
+impl Drop for ServiceProxy {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn handle_service_proxy_connection(
+    mut client: TcpStream,
+    requests: &Arc<Mutex<Vec<String>>>,
+) -> io::Result<()> {
+    client.set_read_timeout(Some(Duration::from_secs(30)))?;
+    client.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let mut header = Vec::new();
+    let mut buffer = [0u8; 2048];
+    let header_end = loop {
+        let count = client.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        header.extend_from_slice(&buffer[..count]);
+        if header.len() > 32 * 1024 {
+            write_proxy_response(&mut client, "431 Request Header Fields Too Large")?;
+            return Ok(());
+        }
+        if let Some(index) = header.windows(4).position(|value| value == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let line_end = header
+        .windows(2)
+        .position(|value| value == b"\r\n")
+        .ok_or_else(|| io::Error::other("proxy request line is missing"))?;
+    let request_line = std::str::from_utf8(&header[..line_end])
+        .map_err(|_| io::Error::other("proxy request line is not UTF-8"))?;
+    let mut parts = request_line.split_ascii_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or_default();
+    if method != "CONNECT" || version != "HTTP/1.1" || parts.next().is_some() {
+        write_proxy_response(&mut client, "405 Method Not Allowed")?;
+        return Ok(());
+    }
+    let Some((host, port)) = parse_proxy_target(target) else {
+        write_proxy_response(&mut client, "403 Forbidden")?;
+        return Ok(());
+    };
+    if let Ok(mut values) = requests.lock() {
+        values.push(host.clone());
+    }
+    if !allowed_service_host(&host) || port != 443 {
+        write_proxy_response(&mut client, "403 Forbidden")?;
+        return Ok(());
+    }
+    let addresses = (host.as_str(), port).to_socket_addrs()?;
+    let mut upstream = None;
+    for address in addresses {
+        if let Ok(stream) = TcpStream::connect_timeout(&address, Duration::from_secs(20)) {
+            upstream = Some(stream);
+            break;
+        }
+    }
+    let Some(mut upstream) = upstream else {
+        write_proxy_response(&mut client, "502 Bad Gateway")?;
+        return Ok(());
+    };
+    upstream.set_read_timeout(Some(PROCESS_TIMEOUT))?;
+    upstream.set_write_timeout(Some(PROCESS_TIMEOUT))?;
+    client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+    if header_end < header.len() {
+        upstream.write_all(&header[header_end..])?;
+    }
+    let mut client_reader = client.try_clone()?;
+    let mut upstream_writer = upstream.try_clone()?;
+    let upload = thread::spawn(move || io::copy(&mut client_reader, &mut upstream_writer));
+    let _ = io::copy(&mut upstream, &mut client);
+    let _ = upload.join();
+    Ok(())
+}
+
+fn write_proxy_response(stream: &mut TcpStream, status: &str) -> io::Result<()> {
+    stream.write_all(format!("HTTP/1.1 {status}\r\nConnection: close\r\n\r\n").as_bytes())
+}
+
+fn parse_proxy_target(target: &str) -> Option<(String, u16)> {
+    let (host, port) = target.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') || host.contains('@') {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), port.parse().ok()?))
+}
+
+fn allowed_service_host(host: &str) -> bool {
+    let valid_name = host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || value == b'-')
+    });
+    valid_name
+        && ["openai.com", "chatgpt.com"]
+            .iter()
+            .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+}
+
+fn outer_profile(
+    codex: &Path,
+    home: &Path,
+    run: &Path,
+    snapshot: &Path,
+    proxy: SocketAddr,
+) -> String {
     format!(
-        "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow file-read* (subpath \"/System\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") (subpath \"/Library/Apple\") (subpath \"/opt/homebrew\") (subpath \"/private/etc\") (subpath \"/dev\") (subpath {codex}) (subpath {home}) (subpath {run}) (subpath {snapshot}))\n(allow file-write* (subpath {home}) (subpath {run}))\n(deny file-write* (subpath {snapshot}))\n(allow network-outbound)\n",
+        "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow file-read* (subpath \"/System\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") (subpath \"/Library/Apple\") (subpath \"/opt/homebrew\") (subpath \"/private/etc\") (subpath \"/dev\") (subpath {codex}) (subpath {home}) (subpath {run}) (subpath {snapshot}))\n(allow file-write* (subpath {home}) (subpath {run}))\n(deny file-write* (subpath {snapshot}))\n(allow network-outbound (remote ip \"{proxy}\"))\n",
         codex = sandbox_string(codex),
         home = sandbox_string(home),
         run = sandbox_string(run),
         snapshot = sandbox_string(snapshot),
+        proxy = proxy,
     )
 }
 
@@ -636,13 +945,7 @@ fn make_snapshot_read_only(root: &Path) -> io::Result<()> {
 }
 
 fn read_nofollow(path: &Path) -> io::Result<Vec<u8>> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW_ANY)
-        .open(path)?;
-    let mut content = Vec::new();
-    file.read_to_end(&mut content)?;
-    Ok(content)
+    read_bounded_nofollow(path, 512 * 1024 * 1024)
 }
 
 fn read_bounded_nofollow(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
@@ -677,6 +980,22 @@ fn private_regular_metadata(path: &Path) -> io::Result<fs::Metadata> {
         return Err(io::Error::other("private file has unsafe metadata"));
     }
     Ok(metadata)
+}
+
+fn move_private_auth(source_home: &Path, destination_home: &Path) -> io::Result<()> {
+    let source = source_home.join("auth.json");
+    let destination = destination_home.join("auth.json");
+    private_regular_metadata(&source)?;
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => {
+            private_regular_metadata(&destination)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(&source, &destination)?;
+    private_regular_metadata(&destination)?;
+    Ok(())
 }
 
 fn write_private(path: &Path, content: &[u8]) -> io::Result<()> {
@@ -725,14 +1044,18 @@ mod tests {
     fn launch_uses_a_neutral_directory_and_clears_sensitive_environment() {
         let base = Path::new("/private/tmp/juno-verifier-test");
         let neutral = base.join("neutral");
+        let proxy = "127.0.0.1:43123".parse().unwrap();
         let spec = launch_spec(
             Path::new("/opt/homebrew/bin/codex"),
             &base.join("home"),
             &neutral,
-            &base.join("outer.sb"),
-            &base.join("schema.json"),
-            &base.join("result.json"),
+            StrictLaunchFiles {
+                profile: &base.join("outer.sb"),
+                schema: &base.join("schema.json"),
+                result: &base.join("result.json"),
+            },
             "review /private/tmp/snapshot",
+            proxy,
         )
         .unwrap();
         assert_eq!(spec.cwd, neutral);
@@ -762,16 +1085,49 @@ mod tests {
             BTreeSet::from([
                 "CODEX_HOME",
                 "HOME",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
                 "JUNO_STRICT_ACTIVE",
                 "LANG",
                 "PATH",
                 "TMPDIR",
+                "ALL_PROXY",
             ])
         );
         assert!(!keys.contains("OPENAI_API_KEY"));
         assert!(!keys.contains("CODEX_API_KEY"));
-        assert!(!keys.contains("HTTP_PROXY"));
         assert!(!keys.contains("SSH_AUTH_SOCK"));
+        let command_keys = isolated_environment(&base.join("home"), None)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<BTreeSet<_>>();
+        assert!(!command_keys.contains("HTTP_PROXY"));
+        assert!(!command_keys.contains("HTTPS_PROXY"));
+        assert!(!command_keys.contains("ALL_PROXY"));
+    }
+
+    #[test]
+    fn outer_sandbox_and_proxy_allow_only_service_tunnels() {
+        let base = Path::new("/private/tmp/juno-verifier-test");
+        let proxy = "127.0.0.1:43123".parse().unwrap();
+        let profile = outer_profile(
+            Path::new("/opt/homebrew/bin/codex"),
+            &base.join("home"),
+            &base.join("run"),
+            &base.join("snapshot"),
+            proxy,
+        );
+        assert!(profile.contains("(allow network-outbound (remote ip \"127.0.0.1:43123\"))"));
+        assert!(!profile.contains("(allow network-outbound)"));
+        assert_eq!(
+            parse_proxy_target("api.openai.com:443"),
+            Some(("api.openai.com".into(), 443))
+        );
+        assert!(allowed_service_host("api.openai.com"));
+        assert!(allowed_service_host("chatgpt.com"));
+        assert!(!allowed_service_host("openai.com.example.org"));
+        assert!(!allowed_service_host("127.0.0.1"));
+        assert!(parse_proxy_target("api.openai.com@127.0.0.1:443").is_none());
     }
 
     #[test]
@@ -833,8 +1189,26 @@ mod tests {
     }
 
     #[test]
-    fn strict_contract_is_blocked_and_has_unique_canaries() {
+    fn strict_contract_has_unique_canaries() {
         assert_eq!(required_canaries().unwrap().len(), 15);
-        assert_eq!(strict_verification_enabled(), Ok(false));
+    }
+
+    #[test]
+    fn login_credential_moves_without_leaving_a_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let source = base.join("source");
+        let destination = base.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let auth = source.join("auth.json");
+        fs::write(&auth, b"credential").unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        move_private_auth(&source, &destination).unwrap();
+        assert!(!source.join("auth.json").exists());
+        assert_eq!(
+            fs::read(destination.join("auth.json")).unwrap(),
+            b"credential"
+        );
     }
 }

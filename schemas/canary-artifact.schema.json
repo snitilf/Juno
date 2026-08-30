@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "name",
+    "candidate_sha256",
+    "juno_sha256",
+    "codex_sha256",
+    "execution_context",
+    "passed",
+    "probe_sha256",
+    "output_sha256",
+    "environment_sha256",
+    "summary"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "candidate_sha256": { "$ref": "#/$defs/sha256" },
+    "juno_sha256": { "$ref": "#/$defs/sha256" },
+    "codex_sha256": { "$ref": "#/$defs/sha256" },
+    "execution_context": { "const": "unsandboxed-dedicated-account" },
+    "passed": { "const": true },
+    "probe_sha256": { "$ref": "#/$defs/sha256" },
+    "output_sha256": { "$ref": "#/$defs/sha256" },
+    "environment_sha256": { "$ref": "#/$defs/sha256" },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 4096 }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    }
+  }
+}

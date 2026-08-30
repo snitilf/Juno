@@ -109,8 +109,8 @@ assert certification["gates"]["clean_false_positives_max"] == 1
 with (root / "evals/development-cases.toml").open("rb") as handle:
     development = tomllib.load(handle)
 assert development["status"] == "open"
-assert len(development["cases"]) == 24
-assert len({case["id"] for case in development["cases"]}) == 24
+assert len(development["cases"]) == 30
+assert len({case["id"] for case in development["cases"]}) == 30
 
 ledger = (root / "docs/REVALIDATION.md").read_text()
 rows = [line for line in ledger.splitlines() if line.startswith("| C-")]
@@ -181,13 +181,31 @@ required_files = (
     "LICENSE",
     "docs/lifecycle.md",
     "docs/verification.md",
+    "docs/adr/0006-post-freeze-evidence.md",
     "config/compatibility.toml",
     "scripts/build-bundle.sh",
     "scripts/release-gates.sh",
     "examples/release-gates.rs",
     "evals/development-cases.toml",
+    "schemas/canary-artifact.schema.json",
+    "schemas/certification-fixture.schema.json",
+    "schemas/certification-result.schema.json",
+    "schemas/release-evidence.schema.json",
+    "scripts/desktop-certification.applescript",
 )
 for name in required_files:
     assert (root / name).is_file(), f"missing required file: {name}"
+
+bundle_script = (root / "scripts/build-bundle.sh").read_text()
+assert "FROZEN_BINARY RELEASE_EVIDENCE" in bundle_script
+assert 'release-evidence.json' in bundle_script
+
+logical_bundle = (root / "src/lifecycle.rs").read_text()
+for name in (
+    "certification-fixture.schema.json",
+    "certification-result.schema.json",
+    "desktop-certification.applescript",
+):
+    assert name in logical_bundle, f"logical bundle omits {name}"
 print("contract tests passed")
 PY

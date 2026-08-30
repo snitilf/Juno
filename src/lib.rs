@@ -17,6 +17,9 @@ pub use lifecycle::{
     execute_lifecycle,
 };
 pub use snapshot::{GitDiffMetadata, Snapshot, SnapshotEntry, create_snapshot};
-pub use verifier::{EvidencePacket, VerifyRequest, verifier_login, verify};
+pub use verifier::{
+    EvidencePacket, StrictProbeRequest, StrictProbeResult, VerifyRequest, execute_strict_probe,
+    verifier_login, verify,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

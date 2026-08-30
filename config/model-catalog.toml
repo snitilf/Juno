@@ -1,17 +1,8 @@
 schema_version = 1
-verified_on = "2026-08-28"
+verified_on = "2026-08-29"
 status = "bootstrap-hypothesis"
 model_scope = "official-openai-only"
 model_family = "gpt-5.6"
-
-[models.main]
-id = "gpt-5.6"
-id_kind = "alias"
-tier = "main"
-lifecycle = "active"
-candidate_efforts = ["low", "medium", "high", "xhigh"]
-effort_support = "hypothesis"
-source_url = "https://learn.chatgpt.com/docs/models"
 
 [models.flagship]
 id = "gpt-5.6-sol"
@@ -41,7 +32,7 @@ effort_support = "hypothesis"
 source_url = "https://learn.chatgpt.com/docs/models"
 
 [bindings.main]
-model = "main"
+model = "flagship"
 effort = "medium"
 status = "hypothesis"
 

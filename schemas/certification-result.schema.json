@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["owner", "verifier", "material_findings", "observation"],
+  "properties": {
+    "owner": {
+      "enum": ["main", "scout", "surveyor", "mech_executor", "executor", "security_executor"]
+    },
+    "verifier": {
+      "enum": ["light_verifier", "verifier", "heavy_verifier"]
+    },
+    "material_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "seed_id", "summary"],
+        "properties": {
+          "severity": { "enum": ["critical", "high", "medium", "low"] },
+          "seed_id": {
+            "oneOf": [
+              { "type": "string", "minLength": 1, "maxLength": 200 },
+              { "type": "null" }
+            ]
+          },
+          "summary": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        }
+      }
+    },
+    "observation": { "type": "string", "minLength": 1, "maxLength": 4096 }
+  }
+}
